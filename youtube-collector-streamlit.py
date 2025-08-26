@@ -62,33 +62,33 @@ class YouTubeCollector:
         self.youtube = build('youtube', 'v3', developerKey=api_key)
         self.search_queries = {
             'heartwarming': [
-                'heartwarming moments caught on camera',
-                'acts of kindness compilation',
+                'heartwarming moments caught on camera 2024',
+                'acts of kindness 2024',
                 'wholesome content that will make you smile',
-                'faith in humanity restored',
+                'faith in humanity restored 2024',
                 'emotional reunions caught on tape',
-                'random acts of kindness',
-                'heartwarming animal rescues',
-                'surprise homecoming compilation'
+                'random acts of kindness viral',
+                'heartwarming animal rescues 2024',
+                'surprise homecoming soldier'
             ],
             'funny': [
-                'funny fails 2024',
-                'unexpected moments caught on camera',
-                'comedy sketches viral',
-                'hilarious reactions compilation',
+                'funny fails 2024 new',
+                'unexpected moments caught on camera 2024',
+                'comedy sketches viral tiktok',
+                'hilarious reactions 2024',
                 'funny animals doing stupid things',
-                'epic fail compilation new',
+                'epic fail 2024 new videos',
                 'instant karma funny moments',
-                'comedy gold moments'
+                'comedy gold moments viral'
             ],
             'traumatic': [
-                'shocking moments caught on camera',
-                'dramatic rescue operations',
-                'natural disaster footage',
-                'intense police chases',
+                'shocking moments caught on camera 2024',
+                'dramatic rescue operations real',
+                'natural disaster footage 2024',
+                'intense police chases dashcam',
                 'survival stories real footage',
                 'near death experiences caught on tape',
-                'unbelievable close calls',
+                'unbelievable close calls 2024',
                 'extreme weather caught on camera'
             ]
         }
@@ -101,7 +101,7 @@ class YouTubeCollector:
         ]
         
         self.compilation_keywords = [
-            'compilation', 'best of', 'top 10', 'top 20',
+            'best of', 'top 10', 'top 20',
             'montage', 'every time', 'all moments', 'mega compilation'
         ]
     
@@ -231,7 +231,8 @@ class YouTubeCollector:
         
         category_index = 0
         attempts = 0
-        max_attempts = 10  # Prevent infinite loops
+        max_attempts = 20  # Increased for better results
+        videos_checked_ids = set()  # Track checked videos to avoid rechecking
         
         while len(collected) < target_count and attempts < max_attempts:
             current_category = categories[category_index % len(categories)]
@@ -243,18 +244,27 @@ class YouTubeCollector:
             self.add_log(f"Searching category '{current_category}': {query}", "INFO")
             
             # Search for videos
-            search_results = self.search_videos(query)
+            search_results = self.search_videos(query, max_results=25)  # Reduced for efficiency
             
             if not search_results:
                 self.add_log("No results found for query, trying another...", "WARNING")
                 attempts += 1
+                category_index += 1  # Try next category
                 continue
             
             # Process each video
+            videos_found_this_query = 0
             for item in search_results:
                 if len(collected) >= target_count:
                     break
                 
+                video_id = item['id']['videoId']
+                
+                # Skip if already checked
+                if video_id in videos_checked_ids:
+                    continue
+                    
+                videos_checked_ids.add(video_id)
                 st.session_state.stats['checked'] += 1
                 
                 # Validate video
@@ -262,7 +272,6 @@ class YouTubeCollector:
                 
                 if passed:
                     # Get full video details
-                    video_id = item['id']['videoId']
                     details = self.get_video_details(video_id)
                     
                     if details:
@@ -288,6 +297,7 @@ class YouTubeCollector:
                         collected.append(video_record)
                         st.session_state.collected_videos.append(video_record)
                         st.session_state.stats['found'] += 1
+                        videos_found_this_query += 1
                         
                         self.add_log(f"✓ Added: {video_record['title'][:50]}...", "SUCCESS")
                         
@@ -298,15 +308,27 @@ class YouTubeCollector:
                     self.add_log(f"✗ Rejected: {item['snippet']['title'][:50]}... - {reason}", "WARNING")
                 
                 # Small delay to avoid rate limiting
-                time.sleep(0.5)
+                time.sleep(0.3)
             
-            category_index += 1
+            # If no videos found with this query, try next category quickly
+            if videos_found_this_query == 0:
+                self.add_log(f"No valid videos found with this query, switching category...", "INFO")
+                category_index += 1
+            else:
+                # Stay with successful category for a bit
+                if videos_found_this_query >= 2:
+                    category_index += 1  # Only switch after finding some videos
+            
             attempts += 1
             
             # Delay between searches
-            time.sleep(2)
+            time.sleep(1.5)
         
-        self.add_log(f"Collection complete! Found {len(collected)} videos.", "SUCCESS")
+        if len(collected) > 0:
+            self.add_log(f"Collection complete! Found {len(collected)} videos.", "SUCCESS")
+        else:
+            self.add_log(f"No valid videos found after {attempts} attempts. Try different settings.", "WARNING")
+        
         return collected
 
 class GoogleSheetsExporter:
