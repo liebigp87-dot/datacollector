@@ -12,7 +12,7 @@ def check_caption_availability(self, details: Dict) -> bool:
             else:
                 return False
         except:
-            return False"""
+            return False
 YouTube Data Collector - Streamlit App
 Collects filtered YouTube videos and exports to Google Sheets for n8n workflows
 """
