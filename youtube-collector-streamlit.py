@@ -1,18 +1,4 @@
-def check_caption_availability(self, details: Dict) -> bool:
-        """Check if video has captions (auto-generated or manual)"""
-        try:
-            # Get caption value - could be boolean or string
-            caption_value = details.get('contentDetails', {}).get('caption', False)
-            
-            # Handle both boolean and string responses
-            if isinstance(caption_value, bool):
-                return caption_value
-            elif isinstance(caption_value, str):
-                return caption_value.lower() == 'true'
-            else:
-                return False
-        except:
-            return False
+"""
 YouTube Data Collector - Streamlit App
 Collects filtered YouTube videos and exports to Google Sheets for n8n workflows
 """
@@ -39,8 +25,6 @@ try:
 except ImportError:
     st.error("Please install gspread and google-auth: pip install gspread google-auth")
     st.stop()
-
-# YouTube Transcript API removed - using YouTube API caption field instead
 
 try:
     import isodate
@@ -150,9 +134,7 @@ class YouTubeCollector:
             return []
     
     def is_youtube_short(self, video_id: str, details: Dict) -> bool:
-        """
-        Check if video is a YouTube Short based on multiple criteria
-        """
+        """Check if video is a YouTube Short based on multiple criteria"""
         try:
             # Method 1: Check duration (Shorts are typically <= 60 seconds)
             duration = isodate.parse_duration(details['contentDetails']['duration'])
@@ -189,9 +171,7 @@ class YouTubeCollector:
             return False
     
     def load_existing_sheet_ids(self, spreadsheet_id: str) -> set:
-        """
-        Load existing video IDs from Google Sheet for duplicate checking
-        """
+        """Load existing video IDs from Google Sheet for duplicate checking"""
         try:
             if self.sheets_exporter:
                 spreadsheet = self.sheets_exporter.get_spreadsheet_by_id(spreadsheet_id)
@@ -217,6 +197,22 @@ class YouTubeCollector:
             self.add_log(f"Could not load existing sheet IDs: {str(e)}", "WARNING")
             return set()
     
+    def check_caption_availability(self, details: Dict) -> bool:
+        """Check if video has captions (auto-generated or manual)"""
+        try:
+            # Get caption value - could be boolean or string
+            caption_value = details.get('contentDetails', {}).get('caption', False)
+            
+            # Handle both boolean and string responses
+            if isinstance(caption_value, bool):
+                return caption_value
+            elif isinstance(caption_value, str):
+                return caption_value.lower() == 'true'
+            else:
+                return False
+        except:
+            return False
+    
     def get_video_details(self, video_id: str) -> Optional[Dict]:
         """Get detailed information about a video including caption availability"""
         try:
@@ -235,10 +231,7 @@ class YouTubeCollector:
             return None
     
     def validate_video(self, search_item: Dict) -> Tuple[bool, str]:
-        """
-        Validate video against all criteria
-        Returns: (passed, reason_if_failed)
-        """
+        """Validate video against all criteria. Returns: (passed, reason_if_failed_or_details)"""
         video_id = search_item['id']['videoId']
         
         # Get ALL video details in one API call (including caption info)
