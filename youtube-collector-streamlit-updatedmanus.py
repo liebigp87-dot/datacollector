@@ -66,7 +66,11 @@ class YouTubeCollector:
                 'emotional reunions caught on tape',
                 'random acts of kindness viral',
                 'heartwarming animal rescues 2024',
-                'surprise homecoming soldier'
+                'surprise homecoming soldier',
+                'feel good stories 2024',
+                'touching moments compilation',
+                'kindness caught on camera',
+                'heartwarming rescue videos'
             ],
             'funny': [
                 'funny fails 2024 new',
@@ -76,7 +80,11 @@ class YouTubeCollector:
                 'funny animals doing stupid things',
                 'epic fail 2024 new videos',
                 'instant karma funny moments',
-                'comedy gold moments viral'
+                'comedy gold moments viral',
+                'funny pranks gone right',
+                'hilarious moments caught on tape',
+                'comedy videos viral',
+                'funny clips 2024'
             ],
             'traumatic': [
                 'shocking moments caught on camera 2024',
@@ -86,7 +94,11 @@ class YouTubeCollector:
                 'survival stories real footage',
                 'near death experiences caught on tape',
                 'unbelievable close calls 2024',
-                'extreme weather caught on camera'
+                'extreme weather caught on camera',
+                'dramatic moments real life',
+                'intense rescue footage',
+                'survival caught on camera',
+                'dramatic real life events'
             ]
         }
         
@@ -107,8 +119,8 @@ class YouTubeCollector:
         timestamp = datetime.now().strftime("%H:%M:%S")
         log_entry = f"[{timestamp}] {log_type}: {message}"
         st.session_state.logs.insert(0, log_entry)
-        # Keep only last 50 logs
-        st.session_state.logs = st.session_state.logs[:50]
+        # Keep only last 100 logs for better debugging
+        st.session_state.logs = st.session_state.logs[:100]
     
     def search_videos(self, query: str, max_results: int = 50) -> List[Dict]:
         """Search for videos using YouTube API"""
@@ -128,10 +140,17 @@ class YouTubeCollector:
             )
             
             response = request.execute()
-            return response.get('items', [])
+            results = response.get('items', [])
+            self.add_log(f"Search returned {len(results)} results for: {query[:50]}...", "INFO")
+            return results
             
         except HttpError as e:
             self.add_log(f"API Error during search: {str(e)}", "ERROR")
+            if "quotaExceeded" in str(e):
+                self.add_log("YouTube API quota exceeded! Wait 24 hours or use different API key.", "ERROR")
+            return []
+        except Exception as e:
+            self.add_log(f"Unexpected error during search: {str(e)}", "ERROR")
             return []
     
     def get_video_details(self, video_id: str) -> Optional[Dict]:
@@ -148,70 +167,77 @@ class YouTubeCollector:
             return None
             
         except HttpError as e:
-            self.add_log(f"API Error getting video details: {str(e)}", "ERROR")
+            self.add_log(f"API Error getting video details for {video_id}: {str(e)}", "ERROR")
+            return None
+        except Exception as e:
+            self.add_log(f"Unexpected error getting video details for {video_id}: {str(e)}", "ERROR")
             return None
     
-    def validate_video(self, video_data: Dict, search_item: Dict) -> Tuple[bool, str]:
+    def validate_video(self, search_item: Dict) -> Tuple[bool, str, Optional[Dict]]:
         """
         Validate video against all criteria
-        Returns: (passed, reason_if_failed)
+        Returns: (passed, reason_if_failed, video_details)
         """
         video_id = search_item['id']['videoId']
         
-        # Check 1: Get video details first (includes caption check)
-        self.add_log(f"Checking video: {search_item['snippet']['title'][:50]}...")
-        details = self.get_video_details(video_id)
-        if not details:
-            return False, "Could not fetch video details"
-        
-        # Check 2: Caption availability (NEW IMPROVED METHOD)
-        has_captions = details['contentDetails'].get('caption', 'false') == 'true'
-        if not has_captions:
-            return False, "No captions available (auto-generated or manual)"
-        
-        # Check 3: Age confirmation (redundant but as specified)
-        published_at = datetime.fromisoformat(details['snippet']['publishedAt'].replace('Z', '+00:00'))
-        six_months_ago = datetime.now(published_at.tzinfo) - timedelta(days=180)
-        if published_at < six_months_ago:
-            return False, "Video older than 6 months"
-        
-        # Check 4: Video length (minimum 90 seconds)
-        duration = isodate.parse_duration(details['contentDetails']['duration'])
-        duration_seconds = duration.total_seconds()
-        if duration_seconds < 90:
-            return False, f"Video too short ({duration_seconds}s < 90s)"
-        
-        # Check 5: Content type exclusion
-        title = details['snippet']['title'].lower()
-        tags = [tag.lower() for tag in details['snippet'].get('tags', [])]
-        
-        # Check for music video indicators
-        for keyword in self.music_keywords:
-            if keyword in title or any(keyword in tag for tag in tags):
-                return False, f"Music video detected (keyword: {keyword})"
-        
-        # Check for compilation indicators
-        for keyword in self.compilation_keywords:
-            if keyword in title or any(keyword in tag for tag in tags):
-                return False, f"Compilation detected (keyword: {keyword})"
-        
-        # Check 6: View count
-        view_count = int(details['statistics'].get('viewCount', 0))
-        if view_count < 10000:
-            return False, f"View count too low ({view_count} < 10,000)"
-        
-        # Check 7: Duplicate check
-        existing_ids = [v['video_id'] for v in st.session_state.collected_videos]
-        if video_id in existing_ids:
-            return False, "Duplicate video"
-        
-        # All checks passed
-        return True, "Passed all checks"
+        try:
+            # Check 1: Get video details first (includes caption check)
+            self.add_log(f"Validating: {search_item['snippet']['title'][:50]}...", "INFO")
+            details = self.get_video_details(video_id)
+            if not details:
+                return False, "Could not fetch video details", None
+            
+            # Check 2: Caption availability (NEW IMPROVED METHOD)
+            has_captions = details['contentDetails'].get('caption', 'false') == 'true'
+            if not has_captions:
+                return False, "No captions available (auto-generated or manual)", None
+            
+            # Check 3: Age confirmation (redundant but as specified)
+            published_at = datetime.fromisoformat(details['snippet']['publishedAt'].replace('Z', '+00:00'))
+            six_months_ago = datetime.now(published_at.tzinfo) - timedelta(days=180)
+            if published_at < six_months_ago:
+                return False, "Video older than 6 months", None
+            
+            # Check 4: Video length (minimum 90 seconds)
+            duration = isodate.parse_duration(details['contentDetails']['duration'])
+            duration_seconds = duration.total_seconds()
+            if duration_seconds < 90:
+                return False, f"Video too short ({duration_seconds}s < 90s)", None
+            
+            # Check 5: Content type exclusion
+            title = details['snippet']['title'].lower()
+            tags = [tag.lower() for tag in details['snippet'].get('tags', [])]
+            
+            # Check for music video indicators
+            for keyword in self.music_keywords:
+                if keyword in title or any(keyword in tag for tag in tags):
+                    return False, f"Music video detected (keyword: {keyword})", None
+            
+            # Check for compilation indicators
+            for keyword in self.compilation_keywords:
+                if keyword in title or any(keyword in tag for tag in tags):
+                    return False, f"Compilation detected (keyword: {keyword})", None
+            
+            # Check 6: View count
+            view_count = int(details['statistics'].get('viewCount', 0))
+            if view_count < 10000:
+                return False, f"View count too low ({view_count} < 10,000)", None
+            
+            # Check 7: Duplicate check
+            existing_ids = [v['video_id'] for v in st.session_state.collected_videos]
+            if video_id in existing_ids:
+                return False, "Duplicate video", None
+            
+            # All checks passed
+            return True, "Passed all checks", details
+            
+        except Exception as e:
+            self.add_log(f"Error validating video {video_id}: {str(e)}", "ERROR")
+            return False, f"Validation error: {str(e)}", None
     
     def collect_videos(self, target_count: int, category: str, progress_callback=None):
-        """Main collection logic"""
+        """Main collection logic with improved error handling and persistence"""
         collected = []
-        queries_used = []
         
         # Determine categories to use
         if category == 'mixed':
@@ -221,104 +247,141 @@ class YouTubeCollector:
         
         category_index = 0
         attempts = 0
-        max_attempts = 20  # Increased for better results
+        max_attempts = 50  # Increased significantly
         videos_checked_ids = set()  # Track checked videos to avoid rechecking
+        consecutive_failures = 0
+        max_consecutive_failures = 10
+        
+        self.add_log(f"Starting collection: Target={target_count}, Category={category}", "INFO")
         
         while len(collected) < target_count and attempts < max_attempts:
-            current_category = categories[category_index % len(categories)]
-            
-            # Select random query from category
-            available_queries = self.search_queries[current_category]
-            query = random.choice(available_queries)
-            
-            self.add_log(f"Searching category '{current_category}': {query}", "INFO")
-            
-            # Search for videos
-            search_results = self.search_videos(query, max_results=25)  # Reduced for efficiency
-            
-            if not search_results:
-                self.add_log("No results found for query, trying another...", "WARNING")
-                attempts += 1
-                category_index += 1  # Try next category
-                continue
-            
-            # Process each video
-            videos_found_this_query = 0
-            for item in search_results:
-                if len(collected) >= target_count:
-                    break
+            try:
+                current_category = categories[category_index % len(categories)]
                 
-                video_id = item['id']['videoId']
+                # Select random query from category
+                available_queries = self.search_queries[current_category]
+                query = random.choice(available_queries)
                 
-                # Skip if already checked
-                if video_id in videos_checked_ids:
+                self.add_log(f"Attempt {attempts+1}/{max_attempts}: Searching '{current_category}' with: {query[:50]}...", "INFO")
+                
+                # Search for videos
+                search_results = self.search_videos(query, max_results=50)  # Increased for better results
+                
+                if not search_results:
+                    self.add_log("No search results, trying different query...", "WARNING")
+                    consecutive_failures += 1
+                    if consecutive_failures >= max_consecutive_failures:
+                        self.add_log(f"Too many consecutive failures ({consecutive_failures}), stopping collection", "ERROR")
+                        break
+                    attempts += 1
+                    category_index += 1
+                    time.sleep(2)  # Wait before retry
                     continue
-                    
-                videos_checked_ids.add(video_id)
-                st.session_state.stats['checked'] += 1
                 
-                # Validate video (now includes caption check)
-                passed, reason = self.validate_video(item, item)
+                # Reset consecutive failures on successful search
+                consecutive_failures = 0
                 
-                if passed:
-                    # Get full video details (already fetched in validate_video, but we need it again)
-                    details = self.get_video_details(video_id)
+                # Process each video
+                videos_found_this_query = 0
+                for i, item in enumerate(search_results):
+                    if len(collected) >= target_count:
+                        self.add_log(f"Target reached! Found {len(collected)}/{target_count} videos", "SUCCESS")
+                        break
                     
-                    if details:
-                        # Create video record
-                        video_record = {
-                            'video_id': video_id,
-                            'title': details['snippet']['title'],
-                            'url': f"https://youtube.com/watch?v={video_id}",
-                            'category': current_category,
-                            'search_query': query,
-                            'duration_seconds': int(isodate.parse_duration(
-                                details['contentDetails']['duration']
-                            ).total_seconds()),
-                            'view_count': int(details['statistics'].get('viewCount', 0)),
-                            'like_count': int(details['statistics'].get('likeCount', 0)),
-                            'comment_count': int(details['statistics'].get('commentCount', 0)),
-                            'published_at': details['snippet']['publishedAt'],
-                            'channel_title': details['snippet']['channelTitle'],
-                            'tags': ','.join(details['snippet'].get('tags', [])),
-                            'has_captions': details['contentDetails'].get('caption', 'false') == 'true',
-                            'collected_at': datetime.now().isoformat()
-                        }
+                    video_id = item['id']['videoId']
+                    
+                    # Skip if already checked
+                    if video_id in videos_checked_ids:
+                        continue
                         
-                        collected.append(video_record)
-                        st.session_state.collected_videos.append(video_record)
-                        st.session_state.stats['found'] += 1
-                        videos_found_this_query += 1
+                    videos_checked_ids.add(video_id)
+                    st.session_state.stats['checked'] += 1
+                    
+                    # Update progress
+                    if progress_callback:
+                        progress_callback(len(collected), target_count)
+                    
+                    # Validate video
+                    try:
+                        passed, reason, details = self.validate_video(item)
                         
-                        self.add_log(f"✓ Added: {video_record['title'][:50]}... (Captions: ✓)", "SUCCESS")
-                        
-                        if progress_callback:
-                            progress_callback(len(collected), target_count)
+                        if passed and details:
+                            # Create video record
+                            video_record = {
+                                'video_id': video_id,
+                                'title': details['snippet']['title'],
+                                'url': f"https://youtube.com/watch?v={video_id}",
+                                'category': current_category,
+                                'search_query': query,
+                                'duration_seconds': int(isodate.parse_duration(
+                                    details['contentDetails']['duration']
+                                ).total_seconds()),
+                                'view_count': int(details['statistics'].get('viewCount', 0)),
+                                'like_count': int(details['statistics'].get('likeCount', 0)),
+                                'comment_count': int(details['statistics'].get('commentCount', 0)),
+                                'published_at': details['snippet']['publishedAt'],
+                                'channel_title': details['snippet']['channelTitle'],
+                                'tags': ','.join(details['snippet'].get('tags', [])),
+                                'has_captions': details['contentDetails'].get('caption', 'false') == 'true',
+                                'collected_at': datetime.now().isoformat()
+                            }
+                            
+                            collected.append(video_record)
+                            st.session_state.collected_videos.append(video_record)
+                            st.session_state.stats['found'] += 1
+                            videos_found_this_query += 1
+                            
+                            self.add_log(f"✓ Added ({len(collected)}/{target_count}): {video_record['title'][:50]}... (Captions: ✓)", "SUCCESS")
+                            
+                        else:
+                            st.session_state.stats['rejected'] += 1
+                            self.add_log(f"✗ Rejected: {item['snippet']['title'][:50]}... - {reason}", "WARNING")
+                    
+                    except Exception as e:
+                        self.add_log(f"Error processing video {video_id}: {str(e)}", "ERROR")
+                        st.session_state.stats['rejected'] += 1
+                    
+                    # Small delay to avoid rate limiting
+                    time.sleep(0.5)
+                
+                # Log results for this query
+                self.add_log(f"Query complete: Found {videos_found_this_query} valid videos from {len(search_results)} results", "INFO")
+                
+                # Strategy for next iteration
+                if videos_found_this_query == 0:
+                    self.add_log("No valid videos found with this query, switching category...", "INFO")
+                    consecutive_failures += 1
+                    category_index += 1
                 else:
-                    st.session_state.stats['rejected'] += 1
-                    self.add_log(f"✗ Rejected: {item['snippet']['title'][:50]}... - {reason}", "WARNING")
+                    consecutive_failures = 0
+                    # Stay with successful category for a bit longer
+                    if videos_found_this_query >= 3:
+                        # Very successful, try another query from same category
+                        pass
+                    else:
+                        # Moderate success, try next category
+                        category_index += 1
                 
-                # Small delay to avoid rate limiting
-                time.sleep(0.3)
-            
-            # If no videos found with this query, try next category quickly
-            if videos_found_this_query == 0:
-                self.add_log(f"No valid videos found with this query, switching category...", "INFO")
-                category_index += 1
-            else:
-                # Stay with successful category for a bit
-                if videos_found_this_query >= 2:
-                    category_index += 1  # Only switch after finding some videos
-            
-            attempts += 1
-            
-            # Delay between searches
-            time.sleep(1.5)
+                attempts += 1
+                
+                # Longer delay between searches to avoid rate limiting
+                time.sleep(2)
+                
+            except Exception as e:
+                self.add_log(f"Unexpected error in collection loop: {str(e)}", "ERROR")
+                attempts += 1
+                time.sleep(3)
+                continue
         
-        if len(collected) > 0:
-            self.add_log(f"Collection complete! Found {len(collected)} videos.", "SUCCESS")
+        # Final summary
+        if len(collected) >= target_count:
+            self.add_log(f"🎉 Collection COMPLETE! Successfully found {len(collected)} videos (target: {target_count})", "SUCCESS")
+        elif attempts >= max_attempts:
+            self.add_log(f"⚠️ Collection stopped: Reached max attempts ({max_attempts}). Found {len(collected)}/{target_count} videos", "WARNING")
         else:
-            self.add_log(f"No valid videos found after {attempts} attempts. Try different settings.", "WARNING")
+            self.add_log(f"⚠️ Collection stopped early. Found {len(collected)}/{target_count} videos", "WARNING")
+        
+        self.add_log(f"Final stats - Checked: {st.session_state.stats['checked']}, Found: {st.session_state.stats['found']}, Rejected: {st.session_state.stats['rejected']}", "INFO")
         
         return collected
 
@@ -533,9 +596,9 @@ def main():
                     status_text = st.empty()
                     
                     def update_progress(current, total):
-                        progress = current / total
+                        progress = min(current / total, 1.0)  # Ensure progress doesn't exceed 1.0
                         progress_bar.progress(progress)
-                        status_text.text(f"Collecting: {current}/{total} videos")
+                        status_text.text(f"Collecting: {current}/{total} videos ({progress*100:.1f}%)")
                     
                     # Run collection
                     with st.spinner(f"Collecting {target_count} videos..."):
@@ -545,7 +608,10 @@ def main():
                             progress_callback=update_progress
                         )
                     
-                    st.success(f"✅ Collection complete! Found {len(videos)} videos.")
+                    if videos:
+                        st.success(f"✅ Collection complete! Found {len(videos)} videos.")
+                    else:
+                        st.warning(f"⚠️ Collection completed but no videos found. Check the logs for details.")
                     
                     # Auto-export if enabled
                     if auto_export and sheets_creds and videos:
