@@ -1,4 +1,18 @@
-"""
+def check_caption_availability(self, details: Dict) -> bool:
+        """Check if video has captions (auto-generated or manual)"""
+        try:
+            # Get caption value - could be boolean or string
+            caption_value = details.get('contentDetails', {}).get('caption', False)
+            
+            # Handle both boolean and string responses
+            if isinstance(caption_value, bool):
+                return caption_value
+            elif isinstance(caption_value, str):
+                return caption_value.lower() == 'true'
+            else:
+                return False
+        except:
+            return False"""
 YouTube Data Collector - Streamlit App
 Collects filtered YouTube videos and exports to Google Sheets for n8n workflows
 """
@@ -54,8 +68,10 @@ if 'logs' not in st.session_state:
 class YouTubeCollector:
     """Main collector class for YouTube videos"""
     
-    def __init__(self, api_key: str):
+    def __init__(self, api_key: str, sheets_exporter=None):
         self.youtube = build('youtube', 'v3', developerKey=api_key)
+        self.sheets_exporter = sheets_exporter  # For duplicate checking
+        self.existing_sheet_ids = set()  # Cache for sheet video IDs
         self.search_queries = {
             'heartwarming': [
                 'heartwarming moments caught on camera 2024',
@@ -133,21 +149,73 @@ class YouTubeCollector:
             self.add_log(f"API Error during search: {str(e)}", "ERROR")
             return []
     
-    def check_caption_availability(self, details: Dict) -> bool:
-        """Check if video has captions (auto-generated or manual)"""
+    def is_youtube_short(self, video_id: str, details: Dict) -> bool:
+        """
+        Check if video is a YouTube Short based on multiple criteria
+        """
         try:
-            # Get caption value - could be boolean or string
-            caption_value = details.get('contentDetails', {}).get('caption', False)
+            # Method 1: Check duration (Shorts are typically <= 60 seconds)
+            duration = isodate.parse_duration(details['contentDetails']['duration'])
+            duration_seconds = duration.total_seconds()
             
-            # Handle both boolean and string responses
-            if isinstance(caption_value, bool):
-                return caption_value
-            elif isinstance(caption_value, str):
-                return caption_value.lower() == 'true'
-            else:
-                return False
-        except:
+            # YouTube Shorts are max 60 seconds
+            if duration_seconds <= 60:
+                return True
+            
+            # Method 2: Check aspect ratio in snippet (Shorts are vertical 9:16)
+            # This info might be in the title or description
+            title = details['snippet'].get('title', '').lower()
+            description = details['snippet'].get('description', '').lower()
+            
+            # Common indicators in titles/descriptions
+            shorts_indicators = ['#shorts', '#short', '#youtubeshorts', '#ytshorts']
+            for indicator in shorts_indicators:
+                if indicator in title or indicator in description:
+                    return True
+            
+            # Method 3: Check if video was uploaded via Shorts camera
+            # Videos under 60s are almost always Shorts
+            if duration_seconds <= 90:
+                # Additional check: vertical videos under 90s are likely Shorts
+                tags = [tag.lower() for tag in details['snippet'].get('tags', [])]
+                if any('short' in tag for tag in tags):
+                    return True
+            
             return False
+            
+        except Exception as e:
+            self.add_log(f"Error checking if video is Short: {str(e)}", "WARNING")
+            # If we can't determine, assume it's not a Short
+            return False
+    
+    def load_existing_sheet_ids(self, spreadsheet_id: str) -> set:
+        """
+        Load existing video IDs from Google Sheet for duplicate checking
+        """
+        try:
+            if self.sheets_exporter:
+                spreadsheet = self.sheets_exporter.get_spreadsheet_by_id(spreadsheet_id)
+                worksheet = spreadsheet.worksheet("raw_links")
+                
+                # Get all values from the sheet
+                all_values = worksheet.get_all_values()
+                
+                if len(all_values) > 1:  # Has header and data
+                    # Find video_id column index
+                    headers = all_values[0]
+                    video_id_index = headers.index('video_id') if 'video_id' in headers else 0
+                    
+                    # Extract all video IDs (skip header row)
+                    existing_ids = {row[video_id_index] for row in all_values[1:] if row[video_id_index]}
+                    
+                    self.add_log(f"Loaded {len(existing_ids)} existing video IDs from sheet", "INFO")
+                    return existing_ids
+                    
+            return set()
+            
+        except Exception as e:
+            self.add_log(f"Could not load existing sheet IDs: {str(e)}", "WARNING")
+            return set()
     
     def get_video_details(self, video_id: str) -> Optional[Dict]:
         """Get detailed information about a video including caption availability"""
@@ -189,7 +257,11 @@ class YouTubeCollector:
         if published_at < six_months_ago:
             return False, "Video older than 6 months"
         
-        # Check 3: Video length (minimum 90 seconds)
+        # Check 3: Check if it's a YouTube Short (replaces duration check)
+        if self.is_youtube_short(video_id, details):
+            return False, "YouTube Short detected"
+        
+        # Also check minimum duration for safety (at least 90 seconds for non-Shorts)
         duration = isodate.parse_duration(details['contentDetails']['duration'])
         duration_seconds = duration.total_seconds()
         if duration_seconds < 90:
@@ -214,18 +286,26 @@ class YouTubeCollector:
         if view_count < 10000:
             return False, f"View count too low ({view_count} < 10,000)"
         
-        # Check 6: Duplicate check
+        # Check 6: Duplicate check (local + Google Sheet)
         existing_ids = [v['video_id'] for v in st.session_state.collected_videos]
         if video_id in existing_ids:
-            return False, "Duplicate video"
+            return False, "Duplicate video (already collected)"
+        
+        # Also check against existing sheet IDs
+        if video_id in self.existing_sheet_ids:
+            return False, "Duplicate video (already in sheet)"
         
         # All checks passed - return details to avoid second API call
         return True, details
     
-    def collect_videos(self, target_count: int, category: str, progress_callback=None):
+    def collect_videos(self, target_count: int, category: str, spreadsheet_id: str = None, progress_callback=None):
         """Main collection logic"""
         collected = []
         queries_used = []
+        
+        # Load existing video IDs from sheet if connected
+        if spreadsheet_id and self.sheets_exporter:
+            self.existing_sheet_ids = self.load_existing_sheet_ids(spreadsheet_id)
         
         # Determine categories to use
         if category == 'mixed':
@@ -562,7 +642,15 @@ def main():
                 st.session_state.logs = []
                 
                 try:
-                    collector = YouTubeCollector(youtube_api_key)
+                    # Create collector with sheets exporter for duplicate checking
+                    exporter = None
+                    if sheets_creds:
+                        try:
+                            exporter = GoogleSheetsExporter(sheets_creds)
+                        except Exception as e:
+                            st.warning(f"Could not initialize sheets exporter: {str(e)}")
+                    
+                    collector = YouTubeCollector(youtube_api_key, sheets_exporter=exporter)
                     
                     # Progress bar
                     progress_bar = st.progress(0)
@@ -573,11 +661,17 @@ def main():
                         progress_bar.progress(progress)
                         status_text.text(f"Collecting: {current}/{total} videos")
                     
+                    # Get spreadsheet ID if using existing sheet
+                    sheet_id = None
+                    if use_existing and spreadsheet_id:
+                        sheet_id = spreadsheet_id
+                    
                     # Run collection
                     with st.spinner(f"Collecting {target_count} videos..."):
                         videos = collector.collect_videos(
                             target_count=target_count,
                             category=category,
+                            spreadsheet_id=sheet_id,
                             progress_callback=update_progress
                         )
                     
