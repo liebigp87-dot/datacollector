@@ -11,12 +11,32 @@ import time
 import random
 from typing import Dict, List, Optional, Tuple
 import re
-from googleapiclient.discovery import build
-from googleapiclient.errors import HttpError
-import gspread
-from google.oauth2.service_account import Credentials
-from youtube_transcript_api import YouTubeTranscriptApi
-import isodate
+
+try:
+    from googleapiclient.discovery import build
+    from googleapiclient.errors import HttpError
+except ImportError:
+    st.error("Please install google-api-python-client: pip install google-api-python-client")
+    st.stop()
+
+try:
+    import gspread
+    from google.oauth2.service_account import Credentials
+except ImportError:
+    st.error("Please install gspread and google-auth: pip install gspread google-auth")
+    st.stop()
+
+try:
+    from youtube_transcript_api import YouTubeTranscriptApi
+except ImportError:
+    st.error("Please install youtube-transcript-api: pip install youtube-transcript-api")
+    st.stop()
+
+try:
+    import isodate
+except ImportError:
+    st.error("Please install isodate: pip install isodate")
+    st.stop()
 
 # Page config
 st.set_page_config(
@@ -301,75 +321,177 @@ class GoogleSheetsExporter:
         )
         self.client = gspread.authorize(self.creds)
     
+    def get_spreadsheet_by_id(self, spreadsheet_id: str):
+        """Get spreadsheet by ID"""
+        try:
+            spreadsheet = self.client.open_by_key(spreadsheet_id)
+            st.success(f"✅ Connected to existing spreadsheet")
+            return spreadsheet
+        except Exception as e:
+            st.error(f"Could not access spreadsheet: {str(e)}")
+            raise e
+    
     def create_or_get_spreadsheet(self, spreadsheet_name: str):
         """Create a new spreadsheet or get existing one"""
         try:
             # Try to open existing spreadsheet
             spreadsheet = self.client.open(spreadsheet_name)
+            st.success(f"✅ Found existing spreadsheet: {spreadsheet_name}")
         except gspread.exceptions.SpreadsheetNotFound:
             # Create new spreadsheet
             spreadsheet = self.client.create(spreadsheet_name)
+            st.success(f"✅ Created new spreadsheet: {spreadsheet_name}")
+            st.warning(f"⚠️ IMPORTANT: Share this spreadsheet with your main Google account to view it!")
         
         return spreadsheet
     
-    def export_to_sheets(self, videos: List[Dict], spreadsheet_name: str = "YouTube_Collection_Data"):
+    def export_to_sheets(self, videos: List[Dict], spreadsheet_id: str = None, spreadsheet_name: str = "YouTube_Collection_Data"):
         """Export videos to Google Sheets"""
-        spreadsheet = self.create_or_get_spreadsheet(spreadsheet_name)
-        
-        # Get or create worksheet
         try:
-            worksheet = spreadsheet.worksheet("raw_links")
-        except gspread.exceptions.WorksheetNotFound:
-            worksheet = spreadsheet.add_worksheet(title="raw_links", rows=1000, cols=20)
-        
-        # Prepare data for export
-        if videos:
-            df = pd.DataFrame(videos)
+            # Use existing spreadsheet by ID or create new one
+            if spreadsheet_id:
+                spreadsheet = self.get_spreadsheet_by_id(spreadsheet_id)
+            else:
+                spreadsheet = self.create_or_get_spreadsheet(spreadsheet_name)
             
-            # Clear existing content
-            worksheet.clear()
+            # Always use "raw_links" as worksheet name
+            worksheet_name = "raw_links"
             
-            # Write headers
-            headers = list(df.columns)
-            worksheet.append_row(headers)
+            # Get or create worksheet
+            try:
+                worksheet = spreadsheet.worksheet(worksheet_name)
+                st.info(f"Using existing worksheet: {worksheet_name}")
+            except gspread.exceptions.WorksheetNotFound:
+                worksheet = spreadsheet.add_worksheet(title=worksheet_name, rows=1000, cols=20)
+                st.success(f"Created new worksheet: {worksheet_name}")
             
-            # Write data
-            for _, row in df.iterrows():
-                worksheet.append_row(row.tolist())
+            # Prepare data for export
+            if videos:
+                df = pd.DataFrame(videos)
+                
+                # Get existing data count for appending
+                existing_data = worksheet.get_all_values()
+                if existing_data and len(existing_data) > 1:  # Has headers and data
+                    st.info(f"Found {len(existing_data)-1} existing rows, appending new data...")
+                    # Don't clear, just append
+                    for _, row in df.iterrows():
+                        values = [str(v) if pd.notna(v) else '' for v in row.tolist()]
+                        worksheet.append_row(values)
+                else:
+                    # First time - add headers and data
+                    worksheet.clear()
+                    headers = list(df.columns)
+                    worksheet.append_row(headers)
+                    for _, row in df.iterrows():
+                        values = [str(v) if pd.notna(v) else '' for v in row.tolist()]
+                        worksheet.append_row(values)
+                
+                return spreadsheet.url
             
-            return spreadsheet.url
-        
-        return None
+            return None
+        except Exception as e:
+            st.error(f"Error exporting to sheets: {str(e)}")
+            raise e
 
 def main():
     st.title("🎬 YouTube Data Collector")
     st.markdown("Collects filtered YouTube videos and exports to Google Sheets for n8n workflows")
+    
+    # Info box about service account
+    with st.expander("ℹ️ Setup Instructions", expanded=False):
+        st.markdown("""
+        ### Required Setup:
+        1. **YouTube API Key**: Get from Google Cloud Console → APIs & Services → Credentials
+        2. **Service Account JSON**: Get from Google Cloud Console → IAM & Admin → Service Accounts
+        3. **Important**: Share the Google Sheet with: `ytlink@testauto-470014.iam.gserviceaccount.com`
+        
+        ### Your Service Account Email:
+        ```
+        ytlink@testauto-470014.iam.gserviceaccount.com
+        ```
+        """)
     
     # Sidebar for configuration
     with st.sidebar:
         st.header("⚙️ Configuration")
         
         # API Keys
-        st.subheader("API Credentials")
-        youtube_api_key = st.text_input("YouTube API Key", type="password", help="Your YouTube Data API v3 key")
+        st.subheader("1. YouTube API")
+        youtube_api_key = st.text_input(
+            "YouTube API Key", 
+            type="password", 
+            help="Your YouTube Data API v3 key from Google Cloud Console"
+        )
         
         # Google Sheets credentials
-        st.subheader("Google Sheets Setup")
-        sheets_creds = st.text_area(
-            "Service Account JSON", 
-            type="password",
-            help="Paste your Google service account JSON credentials",
-            height=150
+        st.subheader("2. Google Sheets Setup")
+        
+        # Option to paste JSON or upload file
+        creds_input_method = st.radio(
+            "How to provide Service Account JSON?",
+            ["Paste JSON", "Upload JSON file"]
         )
         
-        spreadsheet_name = st.text_input(
-            "Spreadsheet Name",
-            value="YouTube_Collection_Data",
-            help="Name for the Google Sheet (will be created if doesn't exist)"
+        sheets_creds = None
+        if creds_input_method == "Paste JSON":
+            sheets_creds_text = st.text_area(
+                "Service Account JSON", 
+                type="password",
+                help="Paste your complete Google service account JSON",
+                height=150,
+                placeholder='{\n  "type": "service_account",\n  "project_id": "...",\n  ...\n}'
+            )
+            if sheets_creds_text:
+                try:
+                    sheets_creds = json.loads(sheets_creds_text)
+                    st.success("✅ Valid JSON")
+                except json.JSONDecodeError as e:
+                    st.error(f"Invalid JSON: {str(e)}")
+        else:
+            uploaded_file = st.file_uploader(
+                "Upload Service Account JSON",
+                type=['json'],
+                help="Upload your service account JSON file"
+            )
+            if uploaded_file:
+                try:
+                    sheets_creds = json.load(uploaded_file)
+                    st.success("✅ JSON file loaded")
+                except Exception as e:
+                    st.error(f"Error reading file: {str(e)}")
+        
+        # Options for existing sheet or new sheet
+        use_existing = st.checkbox(
+            "Use existing Google Sheet",
+            value=True,
+            help="Check if you have an existing sheet to use"
         )
+        
+        if use_existing:
+            spreadsheet_url = st.text_input(
+                "Google Sheet URL",
+                value="https://docs.google.com/spreadsheets/d/1PHvW-LykIpIbwKJbiGHi6NcX7hd4EsIWK3zwr4Dmvrk/",
+                help="Paste the URL of your existing Google Sheet"
+            )
+            # Extract spreadsheet ID from URL
+            import re
+            match = re.search(r'/d/([a-zA-Z0-9-_]+)', spreadsheet_url)
+            spreadsheet_id = match.group(1) if match else None
+            if spreadsheet_id:
+                st.success(f"✅ Sheet ID: {spreadsheet_id[:20]}...")
+        else:
+            spreadsheet_name = st.text_input(
+                "New Spreadsheet Name",
+                value="YouTube_Collection_Data",
+                help="Name for the new Google Sheet to create"
+            )
+        
+        # Show service account email if credentials are loaded
+        if sheets_creds and 'client_email' in sheets_creds:
+            st.info(f"📧 Service Account: {sheets_creds['client_email']}")
         
         # Collection settings
-        st.subheader("Collection Settings")
+        st.subheader("3. Collection Settings")
         category = st.selectbox(
             "Content Category",
             options=['heartwarming', 'funny', 'traumatic', 'mixed'],
@@ -404,9 +526,9 @@ def main():
     col1, col2, col3, col4 = st.columns(4)
     
     with col1:
-        if st.button("🚀 Start Collection", disabled=st.session_state.is_collecting):
+        if st.button("🚀 Start Collection", disabled=st.session_state.is_collecting, type="primary"):
             if not youtube_api_key:
-                st.error("Please enter your YouTube API key")
+                st.error("❌ Please enter your YouTube API key")
             else:
                 st.session_state.is_collecting = True
                 st.session_state.stats = {'checked': 0, 'found': 0, 'rejected': 0}
@@ -432,22 +554,32 @@ def main():
                             progress_callback=update_progress
                         )
                     
-                    st.success(f"Collection complete! Found {len(videos)} videos.")
+                    st.success(f"✅ Collection complete! Found {len(videos)} videos.")
                     
                     # Auto-export if enabled
                     if auto_export and sheets_creds and videos:
                         try:
-                            creds_dict = json.loads(sheets_creds)
-                            exporter = GoogleSheetsExporter(creds_dict)
-                            sheet_url = exporter.export_to_sheets(videos, spreadsheet_name)
-                            st.success(f"✅ Exported to Google Sheets: [Open Sheet]({sheet_url})")
-                            collector.add_log(f"Exported to Google Sheets: {sheet_url}", "SUCCESS")
+                            exporter = GoogleSheetsExporter(sheets_creds)
+                            # Check if using existing sheet
+                            if 'use_existing' in locals() and use_existing and 'spreadsheet_id' in locals() and spreadsheet_id:
+                                sheet_url = exporter.export_to_sheets(videos, spreadsheet_id=spreadsheet_id)
+                            else:
+                                sheet_url = exporter.export_to_sheets(videos, spreadsheet_name=spreadsheet_name if 'spreadsheet_name' in locals() else "YouTube_Collection_Data")
+                            if sheet_url:
+                                st.success(f"✅ Exported to Google Sheets!")
+                                st.markdown(f"📊 [Open Spreadsheet]({sheet_url})")
+                                collector.add_log(f"Exported to Google Sheets: {sheet_url}", "SUCCESS")
                         except Exception as e:
-                            st.error(f"Export failed: {str(e)}")
+                            st.error(f"❌ Export failed: {str(e)}")
+                            st.error("Make sure you've shared the sheet with the service account email!")
                             collector.add_log(f"Export error: {str(e)}", "ERROR")
                 
                 except Exception as e:
-                    st.error(f"Collection error: {str(e)}")
+                    st.error(f"❌ Collection error: {str(e)}")
+                    if "API key not valid" in str(e):
+                        st.error("Your YouTube API key is invalid. Please check it in Google Cloud Console.")
+                    elif "quota" in str(e).lower():
+                        st.error("YouTube API quota exceeded. Wait 24 hours or use a different API key.")
                 finally:
                     st.session_state.is_collecting = False
                     st.rerun()
@@ -467,18 +599,27 @@ def main():
     with col4:
         if st.button("📤 Manual Export") and st.session_state.collected_videos:
             if not sheets_creds:
-                st.error("Please add Google Sheets credentials")
+                st.error("❌ Please add Google Sheets credentials")
             else:
                 try:
-                    creds_dict = json.loads(sheets_creds)
-                    exporter = GoogleSheetsExporter(creds_dict)
-                    sheet_url = exporter.export_to_sheets(
-                        st.session_state.collected_videos, 
-                        spreadsheet_name
-                    )
-                    st.success(f"✅ Exported to Google Sheets: [Open Sheet]({sheet_url})")
+                    exporter = GoogleSheetsExporter(sheets_creds)
+                    # Check if using existing sheet
+                    if use_existing and spreadsheet_id:
+                        sheet_url = exporter.export_to_sheets(
+                            st.session_state.collected_videos, 
+                            spreadsheet_id=spreadsheet_id
+                        )
+                    else:
+                        sheet_url = exporter.export_to_sheets(
+                            st.session_state.collected_videos, 
+                            spreadsheet_name=spreadsheet_name if not use_existing else "YouTube_Collection_Data"
+                        )
+                    if sheet_url:
+                        st.success(f"✅ Exported to Google Sheets!")
+                        st.markdown(f"📊 [Open Spreadsheet]({sheet_url})")
                 except Exception as e:
-                    st.error(f"Export failed: {str(e)}")
+                    st.error(f"❌ Export failed: {str(e)}")
+                    st.error("Tip: Make sure the sheet is shared with your service account email!")
     
     # Display collected videos
     if st.session_state.collected_videos:
