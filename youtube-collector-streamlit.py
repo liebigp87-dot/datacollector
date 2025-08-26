@@ -26,11 +26,7 @@ except ImportError:
     st.error("Please install gspread and google-auth: pip install gspread google-auth")
     st.stop()
 
-try:
-    from youtube_transcript_api import YouTubeTranscriptApi
-except ImportError:
-    st.error("Please install youtube-transcript-api: pip install youtube-transcript-api")
-    st.stop()
+# YouTube Transcript API removed - using YouTube API caption field instead
 
 try:
     import isodate
@@ -137,19 +133,27 @@ class YouTubeCollector:
             self.add_log(f"API Error during search: {str(e)}", "ERROR")
             return []
     
-    def check_transcript_availability(self, video_id: str) -> bool:
-        """Check if transcript is available for the video"""
+    def check_caption_availability(self, details: Dict) -> bool:
+        """Check if video has captions (auto-generated or manual)"""
         try:
-            YouTubeTranscriptApi.list_transcripts(video_id)
-            return True
+            # Get caption value - could be boolean or string
+            caption_value = details.get('contentDetails', {}).get('caption', False)
+            
+            # Handle both boolean and string responses
+            if isinstance(caption_value, bool):
+                return caption_value
+            elif isinstance(caption_value, str):
+                return caption_value.lower() == 'true'
+            else:
+                return False
         except:
             return False
     
     def get_video_details(self, video_id: str) -> Optional[Dict]:
-        """Get detailed information about a video"""
+        """Get detailed information about a video including caption availability"""
         try:
             request = self.youtube.videos().list(
-                part='snippet,contentDetails,statistics',
+                part='snippet,contentDetails,statistics',  # Get all in one call
                 id=video_id
             )
             response = request.execute()
@@ -162,36 +166,36 @@ class YouTubeCollector:
             self.add_log(f"API Error getting video details: {str(e)}", "ERROR")
             return None
     
-    def validate_video(self, video_data: Dict, search_item: Dict) -> Tuple[bool, str]:
+    def validate_video(self, search_item: Dict) -> Tuple[bool, str]:
         """
         Validate video against all criteria
         Returns: (passed, reason_if_failed)
         """
         video_id = search_item['id']['videoId']
         
-        # Check 1: Transcript availability
-        self.add_log(f"Checking transcript for: {search_item['snippet']['title'][:50]}...")
-        if not self.check_transcript_availability(video_id):
-            return False, "No transcript available"
-        
-        # Check 2-6: Get video details for remaining checks
+        # Get ALL video details in one API call (including caption info)
+        self.add_log(f"Checking video: {search_item['snippet']['title'][:50]}...")
         details = self.get_video_details(video_id)
         if not details:
             return False, "Could not fetch video details"
         
-        # Check 3: Age confirmation (redundant but as specified)
+        # Check 1: Caption availability (replaces transcript check)
+        if not self.check_caption_availability(details):
+            return False, "No captions available"
+        
+        # Check 2: Age confirmation
         published_at = datetime.fromisoformat(details['snippet']['publishedAt'].replace('Z', '+00:00'))
         six_months_ago = datetime.now(published_at.tzinfo) - timedelta(days=180)
         if published_at < six_months_ago:
             return False, "Video older than 6 months"
         
-        # Check 4: Video length (minimum 90 seconds)
+        # Check 3: Video length (minimum 90 seconds)
         duration = isodate.parse_duration(details['contentDetails']['duration'])
         duration_seconds = duration.total_seconds()
         if duration_seconds < 90:
             return False, f"Video too short ({duration_seconds}s < 90s)"
         
-        # Check 5: Content type exclusion
+        # Check 4: Content type exclusion
         title = details['snippet']['title'].lower()
         tags = [tag.lower() for tag in details['snippet'].get('tags', [])]
         
@@ -200,23 +204,23 @@ class YouTubeCollector:
             if keyword in title or any(keyword in tag for tag in tags):
                 return False, f"Music video detected (keyword: {keyword})"
         
-        # Check for compilation indicators
+        # Check for compilation indicators  
         for keyword in self.compilation_keywords:
             if keyword in title or any(keyword in tag for tag in tags):
                 return False, f"Compilation detected (keyword: {keyword})"
         
-        # Check 6: View count
+        # Check 5: View count
         view_count = int(details['statistics'].get('viewCount', 0))
         if view_count < 10000:
             return False, f"View count too low ({view_count} < 10,000)"
         
-        # Check 7: Duplicate check
+        # Check 6: Duplicate check
         existing_ids = [v['video_id'] for v in st.session_state.collected_videos]
         if video_id in existing_ids:
             return False, "Duplicate video"
         
-        # All checks passed
-        return True, "Passed all checks"
+        # All checks passed - return details to avoid second API call
+        return True, details
     
     def collect_videos(self, target_count: int, category: str, progress_callback=None):
         """Main collection logic"""
@@ -268,42 +272,43 @@ class YouTubeCollector:
                 st.session_state.stats['checked'] += 1
                 
                 # Validate video
-                passed, reason = self.validate_video(item, item)
+                result = self.validate_video(item)
                 
-                if passed:
-                    # Get full video details
-                    details = self.get_video_details(video_id)
+                if result[0]:  # Passed validation
+                    # We already have details from validation
+                    details = result[1]
                     
-                    if details:
-                        # Create video record
-                        video_record = {
-                            'video_id': video_id,
-                            'title': details['snippet']['title'],
-                            'url': f"https://youtube.com/watch?v={video_id}",
-                            'category': current_category,
-                            'search_query': query,
-                            'duration_seconds': int(isodate.parse_duration(
-                                details['contentDetails']['duration']
-                            ).total_seconds()),
-                            'view_count': int(details['statistics'].get('viewCount', 0)),
-                            'like_count': int(details['statistics'].get('likeCount', 0)),
-                            'comment_count': int(details['statistics'].get('commentCount', 0)),
-                            'published_at': details['snippet']['publishedAt'],
-                            'channel_title': details['snippet']['channelTitle'],
-                            'tags': ','.join(details['snippet'].get('tags', [])),
-                            'collected_at': datetime.now().isoformat()
-                        }
-                        
-                        collected.append(video_record)
-                        st.session_state.collected_videos.append(video_record)
-                        st.session_state.stats['found'] += 1
-                        videos_found_this_query += 1
-                        
-                        self.add_log(f"✓ Added: {video_record['title'][:50]}...", "SUCCESS")
-                        
-                        if progress_callback:
-                            progress_callback(len(collected), target_count)
+                    # Create video record
+                    video_record = {
+                        'video_id': video_id,
+                        'title': details['snippet']['title'],
+                        'url': f"https://youtube.com/watch?v={video_id}",
+                        'category': current_category,
+                        'search_query': query,
+                        'duration_seconds': int(isodate.parse_duration(
+                            details['contentDetails']['duration']
+                        ).total_seconds()),
+                        'view_count': int(details['statistics'].get('viewCount', 0)),
+                        'like_count': int(details['statistics'].get('likeCount', 0)),
+                        'comment_count': int(details['statistics'].get('commentCount', 0)),
+                        'published_at': details['snippet']['publishedAt'],
+                        'channel_title': details['snippet']['channelTitle'],
+                        'tags': ','.join(details['snippet'].get('tags', [])),
+                        'collected_at': datetime.now().isoformat()
+                    }
+                    
+                    collected.append(video_record)
+                    st.session_state.collected_videos.append(video_record)
+                    st.session_state.stats['found'] += 1
+                    videos_found_this_query += 1
+                    
+                    self.add_log(f"✓ Added: {video_record['title'][:50]}...", "SUCCESS")
+                    
+                    if progress_callback:
+                        progress_callback(len(collected), target_count)
                 else:
+                    # Failed validation
+                    reason = result[1]
                     st.session_state.stats['rejected'] += 1
                     self.add_log(f"✗ Rejected: {item['snippet']['title'][:50]}... - {reason}", "WARNING")
                 
