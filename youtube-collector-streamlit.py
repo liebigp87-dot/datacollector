@@ -1,4 +1,29 @@
-"""
+def load_existing_sheet_ids(self, spreadsheet_id: str) -> set:
+        """Load existing video IDs from Google Sheet for duplicate checking"""
+        try:
+            if self.sheets_exporter:
+                spreadsheet = self.sheets_exporter.get_spreadsheet_by_id(spreadsheet_id)
+                worksheet = spreadsheet.worksheet("raw_links")
+                
+                # Get all values from the sheet
+                all_values = worksheet.get_all_values()
+                
+                if len(all_values) > 1:  # Has header and data
+                    # Find video_id column index
+                    headers = all_values[0]
+                    video_id_index = headers.index('video_id') if 'video_id' in headers else 0
+                    
+                    # Extract all video IDs (skip header row)
+                    existing_ids = {row[video_id_index] for row in all_values[1:] if row[video_id_index]}
+                    
+                    self.add_log(f"Loaded {len(existing_ids)} existing video IDs from sheet", "INFO")
+                    return existing_ids
+                    
+            return set()
+            
+        except Exception as e:
+            self.add_log(f"Could not load existing sheet IDs: {str(e)}", "WARNING")
+            return set()"""
 YouTube Data Collector - Streamlit App
 Collects filtered YouTube videos and exports to Google Sheets for n8n workflows
 """
@@ -45,9 +70,11 @@ if 'collected_videos' not in st.session_state:
 if 'is_collecting' not in st.session_state:
     st.session_state.is_collecting = False
 if 'stats' not in st.session_state:
-    st.session_state.stats = {'checked': 0, 'found': 0, 'rejected': 0}
+    st.session_state.stats = {'checked': 0, 'found': 0, 'rejected': 0, 'api_calls': 0}
 if 'logs' not in st.session_state:
     st.session_state.logs = []
+if 'used_queries' not in st.session_state:
+    st.session_state.used_queries = set()
 
 class YouTubeCollector:
     """Main collector class for YouTube videos"""
@@ -56,36 +83,105 @@ class YouTubeCollector:
         self.youtube = build('youtube', 'v3', developerKey=api_key)
         self.sheets_exporter = sheets_exporter  # For duplicate checking
         self.existing_sheet_ids = set()  # Cache for sheet video IDs
+        self.existing_queries = set()  # Cache for used queries
+        
+        # Enhanced search queries - 30 per category, no years, shorter terms
         self.search_queries = {
             'heartwarming': [
-                'heartwarming moments caught on camera 2024',
-                'acts of kindness 2024',
-                'wholesome content that will make you smile',
-                'faith in humanity restored 2024',
-                'emotional reunions caught on tape',
-                'random acts of kindness viral',
-                'heartwarming animal rescues 2024',
-                'surprise homecoming soldier'
+                'soldier surprise homecoming',
+                'dog reunion owner',
+                'random acts kindness',
+                'baby first time hearing',
+                'proposal reaction emotional',
+                'surprise gift reaction',
+                'homeless man helped',
+                'teacher surprised students',
+                'reunion after years',
+                'saving animal rescue',
+                'kid helps stranger',
+                'emotional wedding moment',
+                'surprise visit family',
+                'grateful reaction wholesome',
+                'community helps neighbor',
+                'dad meets baby',
+                'emotional support moment',
+                'stranger pays bill',
+                'found lost pet',
+                'surprise donation reaction',
+                'elderly couple sweet',
+                'child generous sharing',
+                'unexpected hero saves',
+                'touching tribute video',
+                'surprise reunion compilation',
+                'faith humanity restored',
+                'emotional thank you',
+                'surprise birthday elderly',
+                'veteran honored ceremony',
+                'wholesome interaction strangers'
             ],
             'funny': [
-                'funny fails 2024 new',
-                'unexpected moments caught on camera 2024',
-                'comedy sketches viral tiktok',
-                'hilarious reactions 2024',
-                'funny animals doing stupid things',
-                'epic fail 2024 new videos',
-                'instant karma funny moments',
-                'comedy gold moments viral'
+                'funny fails compilation',
+                'unexpected moments caught',
+                'comedy sketches viral',
+                'hilarious reactions',
+                'funny animals doing',
+                'epic fail video',
+                'instant karma funny',
+                'comedy gold moments',
+                'prank goes wrong',
+                'funny kids saying',
+                'dad jokes reaction',
+                'wedding fails funny',
+                'sports bloopers hilarious',
+                'funny news bloopers',
+                'pet fails compilation',
+                'funny work moments',
+                'hilarious misunderstanding',
+                'comedy timing perfect',
+                'funny voice over',
+                'unexpected plot twist',
+                'funny security camera',
+                'hilarious interview moments',
+                'comedy accident harmless',
+                'funny dancing fails',
+                'laughing contagious video',
+                'funny sleep talking',
+                'comedy scare pranks',
+                'funny workout fails',
+                'hilarious costume fails',
+                'funny zoom fails'
             ],
             'traumatic': [
-                'shocking moments caught on camera 2024',
-                'dramatic rescue operations real',
-                'natural disaster footage 2024',
-                'intense police chases dashcam',
-                'survival stories real footage',
-                'near death experiences caught on tape',
-                'unbelievable close calls 2024',
-                'extreme weather caught on camera'
+                'shocking moments caught',
+                'dramatic rescue operation',
+                'natural disaster footage',
+                'intense police chase',
+                'survival story real',
+                'near death experience',
+                'unbelievable close call',
+                'extreme weather footage',
+                'emergency response dramatic',
+                'accident caught camera',
+                'dangerous situation survived',
+                'storm chaser footage',
+                'rescue mission dramatic',
+                'wildfire evacuation footage',
+                'flood rescue dramatic',
+                'earthquake footage real',
+                'tornado close encounter',
+                'avalanche survival story',
+                'lightning strike caught',
+                'road rage incident',
+                'building collapse footage',
+                'helicopter rescue dramatic',
+                'cliff rescue operation',
+                'shark encounter real',
+                'volcano eruption footage',
+                'mudslide caught camera',
+                'train near miss',
+                'bridge collapse footage',
+                'explosion caught camera',
+                'emergency landing footage'
             ]
         }
         
@@ -112,6 +208,9 @@ class YouTubeCollector:
     def search_videos(self, query: str, max_results: int = 50) -> List[Dict]:
         """Search for videos using YouTube API"""
         try:
+            # Track API call
+            st.session_state.stats['api_calls'] += 1
+            
             # Calculate date 6 months ago
             six_months_ago = (datetime.now() - timedelta(days=180)).isoformat() + 'Z'
             
@@ -134,18 +233,12 @@ class YouTubeCollector:
             return []
     
     def is_youtube_short(self, video_id: str, details: Dict) -> bool:
-        """Check if video is a YouTube Short based on multiple criteria"""
+        """Check if video is a YouTube Short - URL pattern first, then duration"""
         try:
-            # Method 1: Check duration (Shorts are typically <= 60 seconds)
-            duration = isodate.parse_duration(details['contentDetails']['duration'])
-            duration_seconds = duration.total_seconds()
+            # Method 1: Check URL pattern (most reliable if available)
+            # Note: We don't have the actual URL in search results, but we can check indicators
             
-            # YouTube Shorts are max 60 seconds
-            if duration_seconds <= 60:
-                return True
-            
-            # Method 2: Check aspect ratio in snippet (Shorts are vertical 9:16)
-            # This info might be in the title or description
+            # Method 2: Check title and description for Shorts indicators
             title = details['snippet'].get('title', '').lower()
             description = details['snippet'].get('description', '').lower()
             
@@ -155,47 +248,66 @@ class YouTubeCollector:
                 if indicator in title or indicator in description:
                     return True
             
-            # Method 3: Check if video was uploaded via Shorts camera
-            # Videos under 60s are almost always Shorts
-            if duration_seconds <= 90:
-                # Additional check: vertical videos under 90s are likely Shorts
-                tags = [tag.lower() for tag in details['snippet'].get('tags', [])]
-                if any('short' in tag for tag in tags):
-                    return True
+            # Method 3: Duration check as fallback (Shorts are max 60 seconds)
+            duration = isodate.parse_duration(details['contentDetails']['duration'])
+            duration_seconds = duration.total_seconds()
+            
+            # Only use duration as definitive indicator if ≤ 60 seconds
+            if duration_seconds <= 60:
+                return True
             
             return False
             
         except Exception as e:
             self.add_log(f"Error checking if video is Short: {str(e)}", "WARNING")
-            # If we can't determine, assume it's not a Short
             return False
     
-    def load_existing_sheet_ids(self, spreadsheet_id: str) -> set:
-        """Load existing video IDs from Google Sheet for duplicate checking"""
+    def load_used_queries(self, spreadsheet_id: str) -> set:
+        """Load previously used queries from Google Sheet"""
         try:
             if self.sheets_exporter:
                 spreadsheet = self.sheets_exporter.get_spreadsheet_by_id(spreadsheet_id)
-                worksheet = spreadsheet.worksheet("raw_links")
                 
-                # Get all values from the sheet
-                all_values = worksheet.get_all_values()
-                
-                if len(all_values) > 1:  # Has header and data
-                    # Find video_id column index
-                    headers = all_values[0]
-                    video_id_index = headers.index('video_id') if 'video_id' in headers else 0
+                # Try to get used_queries worksheet
+                try:
+                    worksheet = spreadsheet.worksheet("used_queries")
+                    all_values = worksheet.get_all_values()
                     
-                    # Extract all video IDs (skip header row)
-                    existing_ids = {row[video_id_index] for row in all_values[1:] if row[video_id_index]}
-                    
-                    self.add_log(f"Loaded {len(existing_ids)} existing video IDs from sheet", "INFO")
-                    return existing_ids
+                    if len(all_values) > 1:  # Has header and data
+                        # Extract all queries (skip header row)
+                        used_queries = {row[0] for row in all_values[1:] if row[0]}
+                        self.add_log(f"Loaded {len(used_queries)} previously used queries", "INFO")
+                        return used_queries
+                except gspread.exceptions.WorksheetNotFound:
+                    # Create the worksheet if it doesn't exist
+                    worksheet = spreadsheet.add_worksheet(title="used_queries", rows=1000, cols=5)
+                    worksheet.append_row(['query', 'category', 'timestamp', 'videos_found', 'session_id'])
+                    self.add_log("Created new used_queries worksheet", "INFO")
                     
             return set()
             
         except Exception as e:
-            self.add_log(f"Could not load existing sheet IDs: {str(e)}", "WARNING")
+            self.add_log(f"Could not load used queries: {str(e)}", "WARNING")
             return set()
+    
+    def save_used_query(self, spreadsheet_id: str, query: str, category: str, videos_found: int):
+        """Save used query to Google Sheet"""
+        try:
+            if self.sheets_exporter:
+                spreadsheet = self.sheets_exporter.get_spreadsheet_by_id(spreadsheet_id)
+                worksheet = spreadsheet.worksheet("used_queries")
+                
+                # Add query record
+                worksheet.append_row([
+                    query,
+                    category,
+                    datetime.now().isoformat(),
+                    videos_found,
+                    st.session_state.get('session_id', 'manual')
+                ])
+                
+        except Exception as e:
+            self.add_log(f"Could not save used query: {str(e)}", "WARNING")
     
     def check_caption_availability(self, details: Dict) -> bool:
         """Check if video has captions (auto-generated or manual)"""
@@ -216,6 +328,9 @@ class YouTubeCollector:
     def get_video_details(self, video_id: str) -> Optional[Dict]:
         """Get detailed information about a video including caption availability"""
         try:
+            # Track API call
+            st.session_state.stats['api_calls'] += 1
+            
             request = self.youtube.videos().list(
                 part='snippet,contentDetails,statistics',  # Get all in one call
                 id=video_id
@@ -294,11 +409,12 @@ class YouTubeCollector:
     def collect_videos(self, target_count: int, category: str, spreadsheet_id: str = None, progress_callback=None):
         """Main collection logic"""
         collected = []
-        queries_used = []
         
-        # Load existing video IDs from sheet if connected
+        # Load existing video IDs and used queries from sheet if connected
         if spreadsheet_id and self.sheets_exporter:
             self.existing_sheet_ids = self.load_existing_sheet_ids(spreadsheet_id)
+            self.existing_queries = self.load_used_queries(spreadsheet_id)
+            st.session_state.used_queries.update(self.existing_queries)
         
         # Determine categories to use
         if category == 'mixed':
@@ -308,15 +424,30 @@ class YouTubeCollector:
         
         category_index = 0
         attempts = 0
-        max_attempts = 20  # Increased for better results
+        max_attempts = 30  # Increased for more query variety
         videos_checked_ids = set()  # Track checked videos to avoid rechecking
         
         while len(collected) < target_count and attempts < max_attempts:
             current_category = categories[category_index % len(categories)]
             
-            # Select random query from category
-            available_queries = self.search_queries[current_category]
-            query = random.choice(available_queries)
+            # Get available queries and shuffle for variety
+            available_queries = self.search_queries[current_category].copy()
+            random.shuffle(available_queries)  # Randomize order
+            
+            # Find an unused query
+            query = None
+            for potential_query in available_queries:
+                if potential_query not in st.session_state.used_queries:
+                    query = potential_query
+                    break
+            
+            # If all queries used, pick a random one
+            if not query:
+                query = random.choice(available_queries)
+                self.add_log(f"All queries used for {current_category}, recycling: {query}", "INFO")
+            
+            # Mark query as used
+            st.session_state.used_queries.add(query)
             
             self.add_log(f"Searching category '{current_category}': {query}", "INFO")
             
@@ -387,6 +518,10 @@ class YouTubeCollector:
                 
                 # Small delay to avoid rate limiting
                 time.sleep(0.3)
+            
+            # Save used query to sheet
+            if spreadsheet_id and self.sheets_exporter:
+                self.save_used_query(spreadsheet_id, query, current_category, videos_found_this_query)
             
             # If no videos found with this query, try next category quickly
             if videos_found_this_query == 0:
@@ -613,7 +748,7 @@ def main():
         )
     
     # Main content area
-    col1, col2, col3 = st.columns(3)
+    col1, col2, col3, col4 = st.columns(4)
     
     with col1:
         st.metric("Videos Found", st.session_state.stats['found'])
@@ -621,6 +756,14 @@ def main():
         st.metric("Videos Checked", st.session_state.stats['checked'])
     with col3:
         st.metric("Videos Rejected", st.session_state.stats['rejected'])
+    with col4:
+        # Calculate API quota usage (approximate)
+        api_calls = st.session_state.stats.get('api_calls', 0)
+        # search.list costs 100 units, videos.list costs 1 unit
+        estimated_units = api_calls * 50  # Average estimate
+        st.metric("API Quota Used", f"{api_calls} calls", 
+                 delta=f"~{estimated_units}/10,000 units",
+                 delta_color="normal" if estimated_units < 8000 else "inverse")
     
     # Control buttons
     col1, col2, col3, col4 = st.columns(4)
