@@ -707,7 +707,6 @@ def main():
         if creds_input_method == "Paste JSON":
             sheets_creds_text = st.text_area(
                 "Service Account JSON", 
-                type="password",
                 help="Paste your complete Google service account JSON",
                 height=150,
                 placeholder='{\n  "type": "service_account",\n  "project_id": "...",\n  ...\n}'
