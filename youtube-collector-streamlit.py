@@ -176,46 +176,57 @@ class YouTubeCollector:
     def check_quota_available(self) -> Tuple[bool, str]:
         """Check if YouTube API quota is available before starting"""
         try:
-            # Make a minimal API call to test quota (costs 1 unit)
-            st.session_state.stats['api_calls'] += 1
+            self.add_log("Checking API quota availability...", "INFO")
             
-            # Use a known video ID (YouTube Rewind 2018 - most disliked video)
+            # Make a minimal API call to test quota (costs 1 unit)
+            # Don't increment counter here as it might fail
             test_request = self.youtube.videos().list(
                 part='id',
                 id='YbJOTdZBX1g'
             )
-            test_request.execute()
+            response = test_request.execute()
+            
+            # Only increment if successful
+            st.session_state.stats['api_calls'] += 1
             
             self.add_log("✅ API quota check passed - quota available", "SUCCESS")
             return True, "Quota available"
             
         except HttpError as e:
             error_str = str(e)
+            error_content = e.content.decode('utf-8') if hasattr(e, 'content') else ''
             
-            if 'quotaExceeded' in error_str or 'quota' in error_str.lower():
+            self.add_log(f"API Error Details: {error_str[:200]}", "ERROR")
+            
+            if 'quotaExceeded' in error_str or 'quotaExceeded' in error_content:
                 self.add_log("❌ YouTube API quota exceeded for today", "ERROR")
                 return False, "Daily quota exceeded (10,000 units). Please wait 24 hours or use a different API key."
             
-            elif 'forbidden' in error_str.lower() or '403' in error_str:
-                if 'access not configured' in error_str.lower():
+            elif 'forbidden' in error_str.lower() or '403' in str(e.resp.status if hasattr(e, 'resp') else ''):
+                if 'youtube.quota' in error_content.lower() or 'quota' in error_content.lower():
+                    self.add_log("❌ YouTube API quota exceeded", "ERROR")
+                    return False, "API quota exceeded. Wait for reset or use different key."
+                elif 'access not configured' in error_content.lower():
                     self.add_log("❌ YouTube Data API v3 not enabled", "ERROR")
                     return False, "YouTube Data API v3 is not enabled in Google Cloud Console"
                 else:
                     self.add_log("❌ API key invalid or restricted", "ERROR")
                     return False, "API key is invalid or doesn't have YouTube Data API access"
             
-            elif 'invalid' in error_str.lower() or '400' in error_str:
+            elif 'invalid' in error_str.lower() or '400' in str(e.resp.status if hasattr(e, 'resp') else ''):
                 self.add_log("❌ Invalid API key format", "ERROR")
                 return False, "Invalid API key format. Please check your API key."
             
             else:
-                self.add_log(f"⚠️ Unexpected API error: {error_str[:100]}", "WARNING")
-                return True, "Unknown error, but attempting to continue"
+                # Log the full error for debugging
+                self.add_log(f"⚠️ Unexpected API error: {error_str[:200]}", "WARNING")
+                # Try to continue anyway for unknown errors
+                return True, "Warning: Could not verify quota, but attempting to continue"
                 
         except Exception as e:
-            self.add_log(f"⚠️ Could not check quota: {str(e)}", "WARNING")
+            self.add_log(f"⚠️ Non-API error during quota check: {str(e)[:200]}", "WARNING")
             # Don't block collection for non-API errors
-            return True, "Could not verify quota, proceeding anyway"
+            return True, "Could not verify quota (non-API error), proceeding anyway"
     
     def search_videos(self, query: str, max_results: int = 50) -> List[Dict]:
         """Search for videos using YouTube API"""
@@ -783,6 +794,12 @@ def main():
             value=True,
             help="Automatically export after collection"
         )
+        
+        skip_quota_check = st.checkbox(
+            "Skip quota check",
+            value=False,
+            help="Skip the API quota pre-flight check (use if check is failing incorrectly)"
+        )
     
     # Main content area
     col1, col2, col3, col4 = st.columns(4)
@@ -828,16 +845,20 @@ def main():
                     
                     collector = YouTubeCollector(youtube_api_key, sheets_exporter=exporter)
                     
-                    # Check API quota before starting
-                    quota_available, quota_message = collector.check_quota_available()
-                    
-                    if not quota_available:
-                        st.error(f"❌ Cannot start collection: {quota_message}")
-                        st.info("💡 Tips:\n- Wait until midnight PT for quota reset\n- Use a different API key\n- Check your Google Cloud Console for quota status")
-                        st.session_state.is_collecting = False
-                        st.stop()
+                    # Check API quota before starting (unless skipped)
+                    if not skip_quota_check:
+                        quota_available, quota_message = collector.check_quota_available()
+                        
+                        if not quota_available:
+                            st.error(f"❌ Cannot start collection: {quota_message}")
+                            st.info("💡 Tips:\n- Wait until midnight PT for quota reset\n- Use a different API key\n- Check your Google Cloud Console for quota status\n- Try enabling 'Skip quota check' if this is a false positive")
+                            st.session_state.is_collecting = False
+                            st.stop()
+                        else:
+                            st.success(f"✅ {quota_message} - Starting collection...")
                     else:
-                        st.success(f"✅ {quota_message} - Starting collection...")
+                        st.warning("⚠️ Skipping quota check - proceeding directly to collection")
+                        collector.add_log("Quota check skipped by user", "INFO")
                     
                     # Progress bar
                     progress_bar = st.progress(0)
