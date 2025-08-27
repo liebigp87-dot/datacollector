@@ -57,11 +57,11 @@ class YouTubeCollector:
     
     def __init__(self, api_key: str, sheets_exporter=None):
         self.youtube = build('youtube', 'v3', developerKey=api_key)
-        self.sheets_exporter = sheets_exporter  # For duplicate checking
-        self.existing_sheet_ids = set()  # Cache for sheet video IDs
-        self.existing_queries = set()  # Cache for used queries
+        self.sheets_exporter = sheets_exporter
+        self.existing_sheet_ids = set()
+        self.existing_queries = set()
         
-        # Enhanced search queries - 30 per category, no years, shorter terms
+        # Enhanced search queries - 30 per category, no years
         self.search_queries = {
             'heartwarming': [
                 'soldier surprise homecoming',
@@ -161,7 +161,7 @@ class YouTubeCollector:
             ]
         }
         
-        # Exclusion keywords for filtering
+        # Exclusion keywords
         self.music_keywords = [
             'music video', 'official video', 'official music',
             'lyrics', 'lyric video', 'audio', 'soundtrack',
@@ -173,68 +173,44 @@ class YouTubeCollector:
             'montage', 'every time', 'all moments', 'mega compilation'
         ]
     
+    def add_log(self, message: str, log_type: str = "INFO"):
+        """Add a log entry"""
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        log_entry = f"[{timestamp}] {log_type}: {message}"
+        st.session_state.logs.insert(0, log_entry)
+        st.session_state.logs = st.session_state.logs[:50]
+    
     def check_quota_available(self) -> Tuple[bool, str]:
-        """Check if YouTube API quota is available before starting"""
+        """Check if YouTube API quota is available"""
         try:
             self.add_log("Checking API quota availability...", "INFO")
-            
-            # Make a minimal API call to test quota (costs 1 unit)
-            # Don't increment counter here as it might fail
             test_request = self.youtube.videos().list(
                 part='id',
                 id='YbJOTdZBX1g'
             )
             response = test_request.execute()
-            
-            # Only increment if successful
             st.session_state.stats['api_calls'] += 1
-            
-            self.add_log("✅ API quota check passed - quota available", "SUCCESS")
+            self.add_log("✅ API quota check passed", "SUCCESS")
             return True, "Quota available"
-            
         except HttpError as e:
             error_str = str(e)
-            error_content = e.content.decode('utf-8') if hasattr(e, 'content') else ''
-            
-            self.add_log(f"API Error Details: {error_str[:200]}", "ERROR")
-            
-            if 'quotaExceeded' in error_str or 'quotaExceeded' in error_content:
-                self.add_log("❌ YouTube API quota exceeded for today", "ERROR")
-                return False, "Daily quota exceeded (10,000 units). Please wait 24 hours or use a different API key."
-            
-            elif 'forbidden' in error_str.lower() or '403' in str(e.resp.status if hasattr(e, 'resp') else ''):
-                if 'youtube.quota' in error_content.lower() or 'quota' in error_content.lower():
-                    self.add_log("❌ YouTube API quota exceeded", "ERROR")
-                    return False, "API quota exceeded. Wait for reset or use different key."
-                elif 'access not configured' in error_content.lower():
-                    self.add_log("❌ YouTube Data API v3 not enabled", "ERROR")
-                    return False, "YouTube Data API v3 is not enabled in Google Cloud Console"
-                else:
-                    self.add_log("❌ API key invalid or restricted", "ERROR")
-                    return False, "API key is invalid or doesn't have YouTube Data API access"
-            
-            elif 'invalid' in error_str.lower() or '400' in str(e.resp.status if hasattr(e, 'resp') else ''):
-                self.add_log("❌ Invalid API key format", "ERROR")
-                return False, "Invalid API key format. Please check your API key."
-            
+            if 'quotaExceeded' in error_str:
+                self.add_log("❌ YouTube API quota exceeded", "ERROR")
+                return False, "Daily quota exceeded. Wait 24 hours or use different API key."
+            elif 'forbidden' in error_str.lower():
+                self.add_log("❌ API access forbidden", "ERROR")
+                return False, "API key invalid or YouTube Data API not enabled"
             else:
-                # Log the full error for debugging
-                self.add_log(f"⚠️ Unexpected API error: {error_str[:200]}", "WARNING")
-                # Try to continue anyway for unknown errors
-                return True, "Warning: Could not verify quota, but attempting to continue"
-                
+                self.add_log(f"⚠️ API error: {error_str[:100]}", "WARNING")
+                return True, "Warning: API error but attempting to continue"
         except Exception as e:
-            self.add_log(f"⚠️ Non-API error during quota check: {str(e)[:200]}", "WARNING")
-            # Don't block collection for non-API errors
-            return True, "Could not verify quota (non-API error), proceeding anyway"
+            self.add_log(f"⚠️ Non-API error: {str(e)[:100]}", "WARNING")
+            return True, "Could not verify quota, proceeding anyway"
     
-    def search_videos(self, query: str, max_results: int = 50) -> List[Dict]:
+    def search_videos(self, query: str, max_results: int = 25) -> List[Dict]:
         """Search for videos using YouTube API"""
         try:
-            # Track API call
             st.session_state.stats['api_calls'] += 1
-            
-            # Calculate date 6 months ago
             six_months_ago = (datetime.now() - timedelta(days=180)).isoformat() + 'Z'
             
             request = self.youtube.search().list(
@@ -244,68 +220,106 @@ class YouTubeCollector:
                 maxResults=max_results,
                 order='relevance',
                 publishedAfter=six_months_ago,
-                videoDuration='medium',  # > 4 minutes
+                videoDuration='medium',
                 relevanceLanguage='en'
             )
             
             response = request.execute()
             return response.get('items', [])
-            
         except HttpError as e:
             self.add_log(f"API Error during search: {str(e)}", "ERROR")
             return []
     
-    def is_youtube_short(self, video_id: str, details: Dict) -> bool:
-        """Check if video is a YouTube Short - URL pattern first, then duration"""
+    def get_video_details(self, video_id: str) -> Optional[Dict]:
+        """Get detailed information about a video"""
         try:
-            # Method 1: Check title and description for Shorts indicators
+            st.session_state.stats['api_calls'] += 1
+            request = self.youtube.videos().list(
+                part='snippet,contentDetails,statistics',
+                id=video_id
+            )
+            response = request.execute()
+            
+            if response['items']:
+                return response['items'][0]
+            return None
+        except HttpError as e:
+            self.add_log(f"API Error getting video details: {str(e)}", "ERROR")
+            return None
+    
+    def is_youtube_short(self, video_id: str, details: Dict) -> bool:
+        """Check if video is a YouTube Short"""
+        try:
             title = details['snippet'].get('title', '').lower()
             description = details['snippet'].get('description', '').lower()
             
-            # Common indicators in titles/descriptions
             shorts_indicators = ['#shorts', '#short', '#youtubeshorts', '#ytshorts']
             for indicator in shorts_indicators:
                 if indicator in title or indicator in description:
                     return True
             
-            # Method 2: Duration check as fallback (Shorts are max 60 seconds)
             duration = isodate.parse_duration(details['contentDetails']['duration'])
             duration_seconds = duration.total_seconds()
             
-            # Only use duration as definitive indicator if ≤ 60 seconds
             if duration_seconds <= 60:
                 return True
             
             return False
-            
         except Exception as e:
             self.add_log(f"Error checking if video is Short: {str(e)}", "WARNING")
             return False
+    
+    def check_caption_availability(self, details: Dict) -> bool:
+        """Check if video has captions"""
+        try:
+            caption_value = details.get('contentDetails', {}).get('caption', False)
+            
+            if isinstance(caption_value, bool):
+                return caption_value
+            elif isinstance(caption_value, str):
+                return caption_value.lower() == 'true'
+            else:
+                return False
+        except:
+            return False
+    
+    def load_existing_sheet_ids(self, spreadsheet_id: str) -> set:
+        """Load existing video IDs from Google Sheet"""
+        try:
+            if self.sheets_exporter:
+                spreadsheet = self.sheets_exporter.get_spreadsheet_by_id(spreadsheet_id)
+                worksheet = spreadsheet.worksheet("raw_links")
+                all_values = worksheet.get_all_values()
+                
+                if len(all_values) > 1:
+                    headers = all_values[0]
+                    video_id_index = headers.index('video_id') if 'video_id' in headers else 0
+                    existing_ids = {row[video_id_index] for row in all_values[1:] if row[video_id_index]}
+                    self.add_log(f"Loaded {len(existing_ids)} existing video IDs from sheet", "INFO")
+                    return existing_ids
+            return set()
+        except Exception as e:
+            self.add_log(f"Could not load existing sheet IDs: {str(e)}", "WARNING")
+            return set()
     
     def load_used_queries(self, spreadsheet_id: str) -> set:
         """Load previously used queries from Google Sheet"""
         try:
             if self.sheets_exporter:
                 spreadsheet = self.sheets_exporter.get_spreadsheet_by_id(spreadsheet_id)
-                
-                # Try to get used_queries worksheet
                 try:
                     worksheet = spreadsheet.worksheet("used_queries")
                     all_values = worksheet.get_all_values()
                     
-                    if len(all_values) > 1:  # Has header and data
-                        # Extract all queries (skip header row)
+                    if len(all_values) > 1:
                         used_queries = {row[0] for row in all_values[1:] if row[0]}
                         self.add_log(f"Loaded {len(used_queries)} previously used queries", "INFO")
                         return used_queries
                 except gspread.exceptions.WorksheetNotFound:
-                    # Create the worksheet if it doesn't exist
                     worksheet = spreadsheet.add_worksheet(title="used_queries", rows=1000, cols=5)
                     worksheet.append_row(['query', 'category', 'timestamp', 'videos_found', 'session_id'])
                     self.add_log("Created new used_queries worksheet", "INFO")
-                    
             return set()
-            
         except Exception as e:
             self.add_log(f"Could not load used queries: {str(e)}", "WARNING")
             return set()
@@ -316,8 +330,6 @@ class YouTubeCollector:
             if self.sheets_exporter:
                 spreadsheet = self.sheets_exporter.get_spreadsheet_by_id(spreadsheet_id)
                 worksheet = spreadsheet.worksheet("used_queries")
-                
-                # Add query record
                 worksheet.append_row([
                     query,
                     category,
@@ -325,84 +337,19 @@ class YouTubeCollector:
                     videos_found,
                     st.session_state.get('session_id', 'manual')
                 ])
-                
         except Exception as e:
             self.add_log(f"Could not save used query: {str(e)}", "WARNING")
     
-    def load_existing_sheet_ids(self, spreadsheet_id: str) -> set:
-        """Load existing video IDs from Google Sheet for duplicate checking"""
-        try:
-            if self.sheets_exporter:
-                spreadsheet = self.sheets_exporter.get_spreadsheet_by_id(spreadsheet_id)
-                worksheet = spreadsheet.worksheet("raw_links")
-                
-                # Get all values from the sheet
-                all_values = worksheet.get_all_values()
-                
-                if len(all_values) > 1:  # Has header and data
-                    # Find video_id column index
-                    headers = all_values[0]
-                    video_id_index = headers.index('video_id') if 'video_id' in headers else 0
-                    
-                    # Extract all video IDs (skip header row)
-                    existing_ids = {row[video_id_index] for row in all_values[1:] if row[video_id_index]}
-                    
-                    self.add_log(f"Loaded {len(existing_ids)} existing video IDs from sheet", "INFO")
-                    return existing_ids
-                    
-            return set()
-            
-        except Exception as e:
-            self.add_log(f"Could not load existing sheet IDs: {str(e)}", "WARNING")
-            return set()
-    
-    def check_caption_availability(self, details: Dict) -> bool:
-        """Check if video has captions (auto-generated or manual)"""
-        try:
-            # Get caption value - could be boolean or string
-            caption_value = details.get('contentDetails', {}).get('caption', False)
-            
-            # Handle both boolean and string responses
-            if isinstance(caption_value, bool):
-                return caption_value
-            elif isinstance(caption_value, str):
-                return caption_value.lower() == 'true'
-            else:
-                return False
-        except:
-            return False
-    
-    def get_video_details(self, video_id: str) -> Optional[Dict]:
-        """Get detailed information about a video including caption availability"""
-        try:
-            # Track API call
-            st.session_state.stats['api_calls'] += 1
-            
-            request = self.youtube.videos().list(
-                part='snippet,contentDetails,statistics',  # Get all in one call
-                id=video_id
-            )
-            response = request.execute()
-            
-            if response['items']:
-                return response['items'][0]
-            return None
-            
-        except HttpError as e:
-            self.add_log(f"API Error getting video details: {str(e)}", "ERROR")
-            return None
-    
     def validate_video(self, search_item: Dict) -> Tuple[bool, str]:
-        """Validate video against all criteria. Returns: (passed, reason_if_failed_or_details)"""
+        """Validate video against all criteria"""
         video_id = search_item['id']['videoId']
         
-        # Get ALL video details in one API call (including caption info)
         self.add_log(f"Checking video: {search_item['snippet']['title'][:50]}...")
         details = self.get_video_details(video_id)
         if not details:
             return False, "Could not fetch video details"
         
-        # Check 1: Caption availability (replaces transcript check)
+        # Check 1: Caption availability
         if not self.check_caption_availability(details):
             return False, "No captions available"
         
@@ -412,11 +359,10 @@ class YouTubeCollector:
         if published_at < six_months_ago:
             return False, "Video older than 6 months"
         
-        # Check 3: Check if it's a YouTube Short (replaces duration check)
+        # Check 3: YouTube Short detection
         if self.is_youtube_short(video_id, details):
             return False, "YouTube Short detected"
         
-        # Also check minimum duration for safety (at least 90 seconds for non-Shorts)
         duration = isodate.parse_duration(details['contentDetails']['duration'])
         duration_seconds = duration.total_seconds()
         if duration_seconds < 90:
@@ -426,12 +372,10 @@ class YouTubeCollector:
         title = details['snippet']['title'].lower()
         tags = [tag.lower() for tag in details['snippet'].get('tags', [])]
         
-        # Check for music video indicators
         for keyword in self.music_keywords:
             if keyword in title or any(keyword in tag for tag in tags):
                 return False, f"Music video detected (keyword: {keyword})"
         
-        # Check for compilation indicators  
         for keyword in self.compilation_keywords:
             if keyword in title or any(keyword in tag for tag in tags):
                 return False, f"Compilation detected (keyword: {keyword})"
@@ -441,79 +385,67 @@ class YouTubeCollector:
         if view_count < 10000:
             return False, f"View count too low ({view_count} < 10,000)"
         
-        # Check 6: Duplicate check (local + Google Sheet)
+        # Check 6: Duplicate check
         existing_ids = [v['video_id'] for v in st.session_state.collected_videos]
         if video_id in existing_ids:
             return False, "Duplicate video (already collected)"
         
-        # Also check against existing sheet IDs
         if video_id in self.existing_sheet_ids:
             return False, "Duplicate video (already in sheet)"
         
-        # All checks passed - return details to avoid second API call
         return True, details
     
     def collect_videos(self, target_count: int, category: str, spreadsheet_id: str = None, progress_callback=None):
         """Main collection logic"""
         collected = []
         
-        try:
-            # Load existing video IDs and used queries from sheet if connected
-            if spreadsheet_id and self.sheets_exporter:
-                try:
-                    self.existing_sheet_ids = self.load_existing_sheet_ids(spreadsheet_id)
-                    self.existing_queries = self.load_used_queries(spreadsheet_id)
-                    st.session_state.used_queries.update(self.existing_queries)
-                except Exception as e:
-                    self.add_log(f"Warning: Could not load existing data from sheet: {str(e)}", "WARNING")
-                    # Continue anyway with empty sets
-                    self.existing_sheet_ids = set()
-                    self.existing_queries = set()
-            
-            # Determine categories to use
-            if category == 'mixed':
-                categories = ['heartwarming', 'funny', 'traumatic']
-            else:
-                categories = [category]
-            
-            self.add_log(f"Starting collection for category: {category}, target: {target_count} videos", "INFO")
-            
-            category_index = 0
-            attempts = 0
-            max_attempts = 30  # Increased for more query variety
-            videos_checked_ids = set()  # Track checked videos to avoid rechecking
+        # Load existing data from sheet
+        if spreadsheet_id and self.sheets_exporter:
+            self.existing_sheet_ids = self.load_existing_sheet_ids(spreadsheet_id)
+            self.existing_queries = self.load_used_queries(spreadsheet_id)
+            st.session_state.used_queries.update(self.existing_queries)
+        
+        # Determine categories
+        if category == 'mixed':
+            categories = ['heartwarming', 'funny', 'traumatic']
+        else:
+            categories = [category]
+        
+        self.add_log(f"Starting collection for category: {category}, target: {target_count} videos", "INFO")
+        
+        category_index = 0
+        attempts = 0
+        max_attempts = 30
+        videos_checked_ids = set()
         
         while len(collected) < target_count and attempts < max_attempts:
             current_category = categories[category_index % len(categories)]
             
-            # Get available queries and shuffle for variety
+            # Get available queries and shuffle
             available_queries = self.search_queries[current_category].copy()
-            random.shuffle(available_queries)  # Randomize order
+            random.shuffle(available_queries)
             
-            # Find an unused query
+            # Find unused query
             query = None
             for potential_query in available_queries:
                 if potential_query not in st.session_state.used_queries:
                     query = potential_query
                     break
             
-            # If all queries used, pick a random one
             if not query:
                 query = random.choice(available_queries)
                 self.add_log(f"All queries used for {current_category}, recycling: {query}", "INFO")
             
-            # Mark query as used
             st.session_state.used_queries.add(query)
-            
             self.add_log(f"Searching category '{current_category}': {query}", "INFO")
             
             # Search for videos
-            search_results = self.search_videos(query, max_results=25)  # Reduced for efficiency
+            search_results = self.search_videos(query)
             
             if not search_results:
                 self.add_log("No results found for query, trying another...", "WARNING")
                 attempts += 1
-                category_index += 1  # Try next category
+                category_index += 1
                 continue
             
             # Process each video
@@ -524,21 +456,18 @@ class YouTubeCollector:
                 
                 video_id = item['id']['videoId']
                 
-                # Skip if already checked
                 if video_id in videos_checked_ids:
                     continue
-                    
+                
                 videos_checked_ids.add(video_id)
                 st.session_state.stats['checked'] += 1
                 
                 # Validate video
                 result = self.validate_video(item)
                 
-                if result[0]:  # Passed validation
-                    # We already have details from validation
+                if result[0]:
                     details = result[1]
                     
-                    # Create video record
                     video_record = {
                         'video_id': video_id,
                         'title': details['snippet']['title'],
@@ -567,38 +496,33 @@ class YouTubeCollector:
                     if progress_callback:
                         progress_callback(len(collected), target_count)
                 else:
-                    # Failed validation
                     reason = result[1]
                     st.session_state.stats['rejected'] += 1
                     self.add_log(f"✗ Rejected: {item['snippet']['title'][:50]}... - {reason}", "WARNING")
                 
-                # Small delay to avoid rate limiting
                 time.sleep(0.3)
             
-            # Save used query to sheet
+            # Save used query
             if spreadsheet_id and self.sheets_exporter:
                 self.save_used_query(spreadsheet_id, query, current_category, videos_found_this_query)
             
-            # If no videos found with this query, try next category quickly
             if videos_found_this_query == 0:
                 self.add_log(f"No valid videos found with this query, switching category...", "INFO")
                 category_index += 1
             else:
-                # Stay with successful category for a bit
                 if videos_found_this_query >= 2:
-                    category_index += 1  # Only switch after finding some videos
+                    category_index += 1
             
             attempts += 1
-            
-            # Delay between searches
             time.sleep(1.5)
         
         if len(collected) > 0:
             self.add_log(f"Collection complete! Found {len(collected)} videos.", "SUCCESS")
         else:
-            self.add_log(f"No valid videos found after {attempts} attempts. Try different settings.", "WARNING")
+            self.add_log(f"No valid videos found after {attempts} attempts.", "WARNING")
         
         return collected
+
 
 class GoogleSheetsExporter:
     """Handle Google Sheets export"""
@@ -625,30 +549,25 @@ class GoogleSheetsExporter:
     def create_or_get_spreadsheet(self, spreadsheet_name: str):
         """Create a new spreadsheet or get existing one"""
         try:
-            # Try to open existing spreadsheet
             spreadsheet = self.client.open(spreadsheet_name)
             st.success(f"✅ Found existing spreadsheet: {spreadsheet_name}")
         except gspread.exceptions.SpreadsheetNotFound:
-            # Create new spreadsheet
             spreadsheet = self.client.create(spreadsheet_name)
             st.success(f"✅ Created new spreadsheet: {spreadsheet_name}")
-            st.warning(f"⚠️ IMPORTANT: Share this spreadsheet with your main Google account to view it!")
+            st.warning(f"⚠️ IMPORTANT: Share this spreadsheet with your main Google account!")
         
         return spreadsheet
     
     def export_to_sheets(self, videos: List[Dict], spreadsheet_id: str = None, spreadsheet_name: str = "YouTube_Collection_Data"):
         """Export videos to Google Sheets"""
         try:
-            # Use existing spreadsheet by ID or create new one
             if spreadsheet_id:
                 spreadsheet = self.get_spreadsheet_by_id(spreadsheet_id)
             else:
                 spreadsheet = self.create_or_get_spreadsheet(spreadsheet_name)
             
-            # Always use "raw_links" as worksheet name
             worksheet_name = "raw_links"
             
-            # Get or create worksheet
             try:
                 worksheet = spreadsheet.worksheet(worksheet_name)
                 st.info(f"Using existing worksheet: {worksheet_name}")
@@ -656,20 +575,16 @@ class GoogleSheetsExporter:
                 worksheet = spreadsheet.add_worksheet(title=worksheet_name, rows=1000, cols=20)
                 st.success(f"Created new worksheet: {worksheet_name}")
             
-            # Prepare data for export
             if videos:
                 df = pd.DataFrame(videos)
-                
-                # Get existing data count for appending
                 existing_data = worksheet.get_all_values()
-                if existing_data and len(existing_data) > 1:  # Has headers and data
+                
+                if existing_data and len(existing_data) > 1:
                     st.info(f"Found {len(existing_data)-1} existing rows, appending new data...")
-                    # Don't clear, just append
                     for _, row in df.iterrows():
                         values = [str(v) if pd.notna(v) else '' for v in row.tolist()]
                         worksheet.append_row(values)
                 else:
-                    # First time - add headers and data
                     worksheet.clear()
                     headers = list(df.columns)
                     worksheet.append_row(headers)
@@ -684,40 +599,32 @@ class GoogleSheetsExporter:
             st.error(f"Error exporting to sheets: {str(e)}")
             raise e
 
+
 def main():
     st.title("🎬 YouTube Data Collector")
     st.markdown("Collects filtered YouTube videos and exports to Google Sheets for n8n workflows")
     
-    # Info box about service account
+    # Info box
     with st.expander("ℹ️ Setup Instructions", expanded=False):
         st.markdown("""
         ### Required Setup:
-        1. **YouTube API Key**: Get from Google Cloud Console → APIs & Services → Credentials
-        2. **Service Account JSON**: Get from Google Cloud Console → IAM & Admin → Service Accounts
-        3. **Important**: Share the Google Sheet with: `ytlink@testauto-470014.iam.gserviceaccount.com`
-        
-        ### Your Service Account Email:
-        ```
-        ytlink@testauto-470014.iam.gserviceaccount.com
-        ```
+        1. **YouTube API Key**: Get from Google Cloud Console
+        2. **Service Account JSON**: Get from Google Cloud Console
+        3. **Share Sheet with**: `ytlink@testauto-470014.iam.gserviceaccount.com`
         """)
     
-    # Sidebar for configuration
+    # Sidebar configuration
     with st.sidebar:
         st.header("⚙️ Configuration")
         
-        # API Keys
         st.subheader("1. YouTube API")
         youtube_api_key = st.text_input(
             "YouTube API Key", 
             type="password", 
-            help="Your YouTube Data API v3 key from Google Cloud Console"
+            help="Your YouTube Data API v3 key"
         )
         
-        # Google Sheets credentials
         st.subheader("2. Google Sheets Setup")
-        
-        # Option to paste JSON or upload file
         creds_input_method = st.radio(
             "How to provide Service Account JSON?",
             ["Paste JSON", "Upload JSON file"]
@@ -728,8 +635,7 @@ def main():
             sheets_creds_text = st.text_area(
                 "Service Account JSON", 
                 help="Paste your complete Google service account JSON",
-                height=150,
-                placeholder='{\n  "type": "service_account",\n  "project_id": "...",\n  ...\n}'
+                height=150
             )
             if sheets_creds_text:
                 try:
@@ -740,8 +646,7 @@ def main():
         else:
             uploaded_file = st.file_uploader(
                 "Upload Service Account JSON",
-                type=['json'],
-                help="Upload your service account JSON file"
+                type=['json']
             )
             if uploaded_file:
                 try:
@@ -750,11 +655,9 @@ def main():
                 except Exception as e:
                     st.error(f"Error reading file: {str(e)}")
         
-        # Options for existing sheet or new sheet
         use_existing = st.checkbox(
             "Use existing Google Sheet",
-            value=True,
-            help="Check if you have an existing sheet to use"
+            value=True
         )
         
         spreadsheet_id = None
@@ -763,10 +666,8 @@ def main():
         if use_existing:
             spreadsheet_url = st.text_input(
                 "Google Sheet URL",
-                value="https://docs.google.com/spreadsheets/d/1PHvW-LykIpIbwKJbiGHi6NcX7hd4EsIWK3zwr4Dmvrk/",
-                help="Paste the URL of your existing Google Sheet"
+                value="https://docs.google.com/spreadsheets/d/1PHvW-LykIpIbwKJbiGHi6NcX7hd4EsIWK3zwr4Dmvrk/"
             )
-            # Extract spreadsheet ID from URL
             match = re.search(r'/d/([a-zA-Z0-9-_]+)', spreadsheet_url)
             spreadsheet_id = match.group(1) if match else None
             if spreadsheet_id:
@@ -774,40 +675,34 @@ def main():
         else:
             spreadsheet_name = st.text_input(
                 "New Spreadsheet Name",
-                value="YouTube_Collection_Data",
-                help="Name for the new Google Sheet to create"
+                value="YouTube_Collection_Data"
             )
         
-        # Show service account email if credentials are loaded
         if sheets_creds and 'client_email' in sheets_creds:
             st.info(f"📧 Service Account: {sheets_creds['client_email']}")
         
-        # Collection settings
         st.subheader("3. Collection Settings")
         category = st.selectbox(
             "Content Category",
-            options=['heartwarming', 'funny', 'traumatic', 'mixed'],
-            help="Select content type or 'mixed' to rotate"
+            options=['heartwarming', 'funny', 'traumatic', 'mixed']
         )
         
         target_count = st.number_input(
             "Target Video Count",
             min_value=1,
             max_value=500,
-            value=10,
-            help="Number of videos to collect"
+            value=10
         )
         
         auto_export = st.checkbox(
             "Auto-export to Google Sheets",
-            value=True,
-            help="Automatically export after collection"
+            value=True
         )
         
         skip_quota_check = st.checkbox(
             "Skip quota check",
             value=False,
-            help="Skip the API quota pre-flight check (use if check is failing incorrectly)"
+            help="Skip the API quota pre-flight check"
         )
     
     # Main content area
@@ -820,10 +715,8 @@ def main():
     with col3:
         st.metric("Videos Rejected", st.session_state.stats['rejected'])
     with col4:
-        # Calculate API quota usage (approximate)
         api_calls = st.session_state.stats.get('api_calls', 0)
-        # search.list costs 100 units, videos.list costs 1 unit
-        estimated_units = api_calls * 50  # Average estimate
+        estimated_units = api_calls * 50
         st.metric("API Quota Used", f"{api_calls} calls", 
                  delta=f"~{estimated_units}/10,000 units",
                  delta_color="normal" if estimated_units < 8000 else "inverse")
@@ -839,12 +732,9 @@ def main():
                 st.session_state.is_collecting = True
                 st.session_state.stats = {'checked': 0, 'found': 0, 'rejected': 0, 'api_calls': 0}
                 st.session_state.logs = []
-                
-                # Generate session ID for tracking
                 st.session_state['session_id'] = str(uuid.uuid4())[:8]
                 
                 try:
-                    # Create collector with sheets exporter for duplicate checking
                     exporter = None
                     if sheets_creds:
                         try:
@@ -854,24 +744,19 @@ def main():
                     
                     collector = YouTubeCollector(youtube_api_key, sheets_exporter=exporter)
                     
-                    # Check API quota before starting (unless skipped)
+                    quota_available = True
                     if not skip_quota_check:
                         quota_available, quota_message = collector.check_quota_available()
-                        
                         if not quota_available:
                             st.error(f"❌ Cannot start collection: {quota_message}")
-                            st.info("💡 Tips:\n- Wait until midnight PT for quota reset\n- Use a different API key\n- Check your Google Cloud Console for quota status\n- Try enabling 'Skip quota check' if this is a false positive")
                             st.session_state.is_collecting = False
                         else:
-                            st.success(f"✅ {quota_message} - Starting collection...")
+                            st.success(f"✅ {quota_message}")
                     else:
-                        st.warning("⚠️ Skipping quota check - proceeding directly to collection")
+                        st.warning("⚠️ Skipping quota check")
                         collector.add_log("Quota check skipped by user", "INFO")
-                        quota_available = True  # Set to true when skipping
                     
-                    # Only proceed if quota is available or check was skipped
-                    if quota_available or skip_quota_check:
-                        # Progress bar
+                    if quota_available:
                         progress_bar = st.progress(0)
                         status_text = st.empty()
                         
@@ -880,12 +765,10 @@ def main():
                             progress_bar.progress(progress)
                             status_text.text(f"Collecting: {current}/{total} videos")
                         
-                        # Get spreadsheet ID if using existing sheet
                         sheet_id = None
                         if use_existing and spreadsheet_id:
                             sheet_id = spreadsheet_id
                         
-                        # Run collection
                         with st.spinner(f"Collecting {target_count} videos..."):
                             videos = collector.collect_videos(
                                 target_count=target_count,
@@ -896,12 +779,10 @@ def main():
                         
                         st.success(f"✅ Collection complete! Found {len(videos)} videos.")
                         
-                        # Auto-export if enabled
                         if auto_export and sheets_creds and videos:
                             try:
                                 if not exporter:
                                     exporter = GoogleSheetsExporter(sheets_creds)
-                                # Check if using existing sheet
                                 if use_existing and spreadsheet_id:
                                     sheet_url = exporter.export_to_sheets(videos, spreadsheet_id=spreadsheet_id)
                                 else:
@@ -912,15 +793,14 @@ def main():
                                     collector.add_log(f"Exported to Google Sheets: {sheet_url}", "SUCCESS")
                             except Exception as e:
                                 st.error(f"❌ Export failed: {str(e)}")
-                                st.error("Make sure you've shared the sheet with the service account email!")
                                 collector.add_log(f"Export error: {str(e)}", "ERROR")
                 
                 except Exception as e:
                     st.error(f"❌ Collection error: {str(e)}")
                     if "API key not valid" in str(e):
-                        st.error("Your YouTube API key is invalid. Please check it in Google Cloud Console.")
+                        st.error("Your YouTube API key is invalid.")
                     elif "quota" in str(e).lower():
-                        st.error("YouTube API quota exceeded. Wait 24 hours or use a different API key.")
+                        st.error("YouTube API quota exceeded.")
                 finally:
                     st.session_state.is_collecting = False
                     st.rerun()
@@ -945,7 +825,6 @@ def main():
             else:
                 try:
                     exporter = GoogleSheetsExporter(sheets_creds)
-                    # Check if using existing sheet
                     if use_existing and spreadsheet_id:
                         sheet_url = exporter.export_to_sheets(
                             st.session_state.collected_videos, 
@@ -961,21 +840,18 @@ def main():
                         st.markdown(f"📊 [Open Spreadsheet]({sheet_url})")
                 except Exception as e:
                     st.error(f"❌ Export failed: {str(e)}")
-                    st.error("Tip: Make sure the sheet is shared with your service account email!")
     
     # Display collected videos
     if st.session_state.collected_videos:
         st.subheader("📊 Collected Videos")
         df = pd.DataFrame(st.session_state.collected_videos)
         
-        # Display summary
         st.dataframe(
             df[['title', 'category', 'view_count', 'duration_seconds', 'url']],
             use_container_width=True,
             hide_index=True
         )
         
-        # Download options
         col1, col2 = st.columns(2)
         with col1:
             csv = df.to_csv(index=False)
