@@ -46,7 +46,7 @@ if 'collected_videos' not in st.session_state:
 if 'is_collecting' not in st.session_state:
     st.session_state.is_collecting = False
 if 'stats' not in st.session_state:
-    st.session_state.stats = {'checked': 0, 'found': 0, 'rejected': 0, 'api_calls': 0}
+    st.session_state.stats = {'checked': 0, 'found': 0, 'rejected': 0, 'api_calls': 0, 'has_captions': 0, 'no_captions': 0}
 if 'logs' not in st.session_state:
     st.session_state.logs = []
 if 'used_queries' not in st.session_state:
@@ -270,17 +270,33 @@ class YouTubeCollector:
             return False
     
     def check_caption_availability(self, details: Dict) -> bool:
-        """Check if video has captions"""
+        """Check if video has captions (auto-generated or manual)"""
         try:
             caption_value = details.get('contentDetails', {}).get('caption', False)
             
+            has_caption = False
             if isinstance(caption_value, bool):
-                return caption_value
+                has_caption = caption_value
             elif isinstance(caption_value, str):
-                return caption_value.lower() == 'true'
+                has_caption = caption_value.lower() == 'true'
+            
+            # Track caption statistics
+            if has_caption:
+                st.session_state.stats['has_captions'] += 1
+                self.add_log(f"✓ Video has captions (auto-generated or manual)", "INFO")
             else:
-                return False
-        except:
+                st.session_state.stats['no_captions'] += 1
+                self.add_log(f"✗ Video has NO captions available", "INFO")
+            
+            # Calculate and log percentage
+            total_caption_checks = st.session_state.stats['has_captions'] + st.session_state.stats['no_captions']
+            if total_caption_checks > 0:
+                caption_percentage = (st.session_state.stats['has_captions'] / total_caption_checks) * 100
+                self.add_log(f"📊 Caption availability: {caption_percentage:.1f}% ({st.session_state.stats['has_captions']}/{total_caption_checks})", "INFO")
+            
+            return has_caption
+        except Exception as e:
+            self.add_log(f"Error checking captions: {str(e)}", "WARNING")
             return False
     
     def load_existing_sheet_ids(self, spreadsheet_id: str) -> set:
@@ -340,7 +356,7 @@ class YouTubeCollector:
         except Exception as e:
             self.add_log(f"Could not save used query: {str(e)}", "WARNING")
     
-    def validate_video(self, search_item: Dict) -> Tuple[bool, str]:
+    def validate_video(self, search_item: Dict, require_captions: bool = True) -> Tuple[bool, str]:
         """Validate video against all criteria"""
         video_id = search_item['id']['videoId']
         
@@ -349,9 +365,14 @@ class YouTubeCollector:
         if not details:
             return False, "Could not fetch video details"
         
-        # Check 1: Caption availability
-        if not self.check_caption_availability(details):
-            return False, "No captions available"
+        # Check 1: Caption availability (optional based on setting)
+        if require_captions:
+            if not self.check_caption_availability(details):
+                return False, "No captions available"
+        else:
+            # Still check captions for statistics, but don't reject
+            self.check_caption_availability(details)
+            self.add_log("Caption check disabled - accepting video regardless of captions", "INFO")
         
         # Check 2: Age confirmation
         published_at = datetime.fromisoformat(details['snippet']['publishedAt'].replace('Z', '+00:00'))
@@ -395,9 +416,11 @@ class YouTubeCollector:
         
         return True, details
     
-    def collect_videos(self, target_count: int, category: str, spreadsheet_id: str = None, progress_callback=None):
+    def collect_videos(self, target_count: int, category: str, spreadsheet_id: str = None, require_captions: bool = True, progress_callback=None):
         """Main collection logic"""
         collected = []
+        
+        self.add_log(f"Caption requirement: {'ENABLED - Only videos with captions' if require_captions else 'DISABLED - All videos accepted'}", "INFO")
         
         # Load existing data from sheet
         if spreadsheet_id and self.sheets_exporter:
@@ -463,7 +486,7 @@ class YouTubeCollector:
                 st.session_state.stats['checked'] += 1
                 
                 # Validate video
-                result = self.validate_video(item)
+                result = self.validate_video(item, require_captions)
                 
                 if result[0]:
                     details = result[1]
@@ -704,9 +727,17 @@ def main():
             value=False,
             help="Skip the API quota pre-flight check"
         )
+        
+        require_captions = st.checkbox(
+            "Require captions",
+            value=True,
+            help="Only collect videos with captions (auto-generated or manual). Uncheck to accept all videos."
+        )
+        
+        st.info(f"💡 Caption Info: When enabled, accepts videos with ANY type of captions including YouTube's auto-generated captions, which work perfectly for subtitle generation.")
     
-    # Main content area
-    col1, col2, col3, col4 = st.columns(4)
+    # Main content area - Added caption statistics
+    col1, col2, col3 = st.columns(3)
     
     with col1:
         st.metric("Videos Found", st.session_state.stats['found'])
@@ -714,12 +745,23 @@ def main():
         st.metric("Videos Checked", st.session_state.stats['checked'])
     with col3:
         st.metric("Videos Rejected", st.session_state.stats['rejected'])
-    with col4:
+    
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        total_caption_checks = st.session_state.stats.get('has_captions', 0) + st.session_state.stats.get('no_captions', 0)
+        caption_rate = (st.session_state.stats.get('has_captions', 0) / total_caption_checks * 100) if total_caption_checks > 0 else 0
+        st.metric("Videos with Captions", 
+                 f"{st.session_state.stats.get('has_captions', 0)}/{total_caption_checks}",
+                 delta=f"{caption_rate:.1f}%")
+    with col2:
         api_calls = st.session_state.stats.get('api_calls', 0)
         estimated_units = api_calls * 50
         st.metric("API Quota Used", f"{api_calls} calls", 
                  delta=f"~{estimated_units}/10,000 units",
                  delta_color="normal" if estimated_units < 8000 else "inverse")
+    with col3:
+        st.metric("Session ID", st.session_state.get('session_id', 'Not started'))
     
     # Control buttons
     col1, col2, col3, col4 = st.columns(4)
@@ -730,7 +772,7 @@ def main():
                 st.error("❌ Please enter your YouTube API key")
             else:
                 st.session_state.is_collecting = True
-                st.session_state.stats = {'checked': 0, 'found': 0, 'rejected': 0, 'api_calls': 0}
+                st.session_state.stats = {'checked': 0, 'found': 0, 'rejected': 0, 'api_calls': 0, 'has_captions': 0, 'no_captions': 0}
                 st.session_state.logs = []
                 st.session_state['session_id'] = str(uuid.uuid4())[:8]
                 
@@ -774,6 +816,7 @@ def main():
                                 target_count=target_count,
                                 category=category,
                                 spreadsheet_id=sheet_id,
+                                require_captions=require_captions,
                                 progress_callback=update_progress
                             )
                         
@@ -813,7 +856,7 @@ def main():
     with col3:
         if st.button("🔄 Reset"):
             st.session_state.collected_videos = []
-            st.session_state.stats = {'checked': 0, 'found': 0, 'rejected': 0, 'api_calls': 0}
+            st.session_state.stats = {'checked': 0, 'found': 0, 'rejected': 0, 'api_calls': 0, 'has_captions': 0, 'no_captions': 0}
             st.session_state.logs = []
             st.session_state.used_queries = set()
             st.rerun()
