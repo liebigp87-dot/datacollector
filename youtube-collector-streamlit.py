@@ -36,6 +36,7 @@ import time
 import random
 from typing import Dict, List, Optional, Tuple
 import re
+import uuid
 
 try:
     from googleapiclient.discovery import build
@@ -849,8 +850,9 @@ def main():
     with col3:
         if st.button("🔄 Reset"):
             st.session_state.collected_videos = []
-            st.session_state.stats = {'checked': 0, 'found': 0, 'rejected': 0}
+            st.session_state.stats = {'checked': 0, 'found': 0, 'rejected': 0, 'api_calls': 0}
             st.session_state.logs = []
+            st.session_state.used_queries = set()
             st.rerun()
     
     with col4:
