@@ -1,29 +1,4 @@
-def load_existing_sheet_ids(self, spreadsheet_id: str) -> set:
-        """Load existing video IDs from Google Sheet for duplicate checking"""
-        try:
-            if self.sheets_exporter:
-                spreadsheet = self.sheets_exporter.get_spreadsheet_by_id(spreadsheet_id)
-                worksheet = spreadsheet.worksheet("raw_links")
-                
-                # Get all values from the sheet
-                all_values = worksheet.get_all_values()
-                
-                if len(all_values) > 1:  # Has header and data
-                    # Find video_id column index
-                    headers = all_values[0]
-                    video_id_index = headers.index('video_id') if 'video_id' in headers else 0
-                    
-                    # Extract all video IDs (skip header row)
-                    existing_ids = {row[video_id_index] for row in all_values[1:] if row[video_id_index]}
-                    
-                    self.add_log(f"Loaded {len(existing_ids)} existing video IDs from sheet", "INFO")
-                    return existing_ids
-                    
-            return set()
-            
-        except Exception as e:
-            self.add_log(f"Could not load existing sheet IDs: {str(e)}", "WARNING")
-            return set()"""
+"""
 YouTube Data Collector - Streamlit App
 Collects filtered YouTube videos and exports to Google Sheets for n8n workflows
 """
@@ -236,10 +211,7 @@ class YouTubeCollector:
     def is_youtube_short(self, video_id: str, details: Dict) -> bool:
         """Check if video is a YouTube Short - URL pattern first, then duration"""
         try:
-            # Method 1: Check URL pattern (most reliable if available)
-            # Note: We don't have the actual URL in search results, but we can check indicators
-            
-            # Method 2: Check title and description for Shorts indicators
+            # Method 1: Check title and description for Shorts indicators
             title = details['snippet'].get('title', '').lower()
             description = details['snippet'].get('description', '').lower()
             
@@ -249,7 +221,7 @@ class YouTubeCollector:
                 if indicator in title or indicator in description:
                     return True
             
-            # Method 3: Duration check as fallback (Shorts are max 60 seconds)
+            # Method 2: Duration check as fallback (Shorts are max 60 seconds)
             duration = isodate.parse_duration(details['contentDetails']['duration'])
             duration_seconds = duration.total_seconds()
             
@@ -309,6 +281,33 @@ class YouTubeCollector:
                 
         except Exception as e:
             self.add_log(f"Could not save used query: {str(e)}", "WARNING")
+    
+    def load_existing_sheet_ids(self, spreadsheet_id: str) -> set:
+        """Load existing video IDs from Google Sheet for duplicate checking"""
+        try:
+            if self.sheets_exporter:
+                spreadsheet = self.sheets_exporter.get_spreadsheet_by_id(spreadsheet_id)
+                worksheet = spreadsheet.worksheet("raw_links")
+                
+                # Get all values from the sheet
+                all_values = worksheet.get_all_values()
+                
+                if len(all_values) > 1:  # Has header and data
+                    # Find video_id column index
+                    headers = all_values[0]
+                    video_id_index = headers.index('video_id') if 'video_id' in headers else 0
+                    
+                    # Extract all video IDs (skip header row)
+                    existing_ids = {row[video_id_index] for row in all_values[1:] if row[video_id_index]}
+                    
+                    self.add_log(f"Loaded {len(existing_ids)} existing video IDs from sheet", "INFO")
+                    return existing_ids
+                    
+            return set()
+            
+        except Exception as e:
+            self.add_log(f"Could not load existing sheet IDs: {str(e)}", "WARNING")
+            return set()
     
     def check_caption_availability(self, details: Dict) -> bool:
         """Check if video has captions (auto-generated or manual)"""
@@ -703,6 +702,9 @@ def main():
             help="Check if you have an existing sheet to use"
         )
         
+        spreadsheet_id = None
+        spreadsheet_name = "YouTube_Collection_Data"
+        
         if use_existing:
             spreadsheet_url = st.text_input(
                 "Google Sheet URL",
@@ -710,7 +712,6 @@ def main():
                 help="Paste the URL of your existing Google Sheet"
             )
             # Extract spreadsheet ID from URL
-            import re
             match = re.search(r'/d/([a-zA-Z0-9-_]+)', spreadsheet_url)
             spreadsheet_id = match.group(1) if match else None
             if spreadsheet_id:
@@ -775,8 +776,11 @@ def main():
                 st.error("❌ Please enter your YouTube API key")
             else:
                 st.session_state.is_collecting = True
-                st.session_state.stats = {'checked': 0, 'found': 0, 'rejected': 0}
+                st.session_state.stats = {'checked': 0, 'found': 0, 'rejected': 0, 'api_calls': 0}
                 st.session_state.logs = []
+                
+                # Generate session ID for tracking
+                st.session_state['session_id'] = str(uuid.uuid4())[:8]
                 
                 try:
                     # Create collector with sheets exporter for duplicate checking
@@ -819,10 +823,10 @@ def main():
                         try:
                             exporter = GoogleSheetsExporter(sheets_creds)
                             # Check if using existing sheet
-                            if 'use_existing' in locals() and use_existing and 'spreadsheet_id' in locals() and spreadsheet_id:
+                            if use_existing and spreadsheet_id:
                                 sheet_url = exporter.export_to_sheets(videos, spreadsheet_id=spreadsheet_id)
                             else:
-                                sheet_url = exporter.export_to_sheets(videos, spreadsheet_name=spreadsheet_name if 'spreadsheet_name' in locals() else "YouTube_Collection_Data")
+                                sheet_url = exporter.export_to_sheets(videos, spreadsheet_name=spreadsheet_name)
                             if sheet_url:
                                 st.success(f"✅ Exported to Google Sheets!")
                                 st.markdown(f"📊 [Open Spreadsheet]({sheet_url})")
@@ -871,7 +875,7 @@ def main():
                     else:
                         sheet_url = exporter.export_to_sheets(
                             st.session_state.collected_videos, 
-                            spreadsheet_name=spreadsheet_name if not use_existing else "YouTube_Collection_Data"
+                            spreadsheet_name=spreadsheet_name
                         )
                     if sheet_url:
                         st.success(f"✅ Exported to Google Sheets!")
