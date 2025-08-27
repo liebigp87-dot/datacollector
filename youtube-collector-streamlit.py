@@ -173,13 +173,49 @@ class YouTubeCollector:
             'montage', 'every time', 'all moments', 'mega compilation'
         ]
     
-    def add_log(self, message: str, log_type: str = "INFO"):
-        """Add a log entry"""
-        timestamp = datetime.now().strftime("%H:%M:%S")
-        log_entry = f"[{timestamp}] {log_type}: {message}"
-        st.session_state.logs.insert(0, log_entry)
-        # Keep only last 50 logs
-        st.session_state.logs = st.session_state.logs[:50]
+    def check_quota_available(self) -> Tuple[bool, str]:
+        """Check if YouTube API quota is available before starting"""
+        try:
+            # Make a minimal API call to test quota (costs 1 unit)
+            st.session_state.stats['api_calls'] += 1
+            
+            # Use a known video ID (YouTube Rewind 2018 - most disliked video)
+            test_request = self.youtube.videos().list(
+                part='id',
+                id='YbJOTdZBX1g'
+            )
+            test_request.execute()
+            
+            self.add_log("✅ API quota check passed - quota available", "SUCCESS")
+            return True, "Quota available"
+            
+        except HttpError as e:
+            error_str = str(e)
+            
+            if 'quotaExceeded' in error_str or 'quota' in error_str.lower():
+                self.add_log("❌ YouTube API quota exceeded for today", "ERROR")
+                return False, "Daily quota exceeded (10,000 units). Please wait 24 hours or use a different API key."
+            
+            elif 'forbidden' in error_str.lower() or '403' in error_str:
+                if 'access not configured' in error_str.lower():
+                    self.add_log("❌ YouTube Data API v3 not enabled", "ERROR")
+                    return False, "YouTube Data API v3 is not enabled in Google Cloud Console"
+                else:
+                    self.add_log("❌ API key invalid or restricted", "ERROR")
+                    return False, "API key is invalid or doesn't have YouTube Data API access"
+            
+            elif 'invalid' in error_str.lower() or '400' in error_str:
+                self.add_log("❌ Invalid API key format", "ERROR")
+                return False, "Invalid API key format. Please check your API key."
+            
+            else:
+                self.add_log(f"⚠️ Unexpected API error: {error_str[:100]}", "WARNING")
+                return True, "Unknown error, but attempting to continue"
+                
+        except Exception as e:
+            self.add_log(f"⚠️ Could not check quota: {str(e)}", "WARNING")
+            # Don't block collection for non-API errors
+            return True, "Could not verify quota, proceeding anyway"
     
     def search_videos(self, query: str, max_results: int = 50) -> List[Dict]:
         """Search for videos using YouTube API"""
@@ -792,6 +828,17 @@ def main():
                             st.warning(f"Could not initialize sheets exporter: {str(e)}")
                     
                     collector = YouTubeCollector(youtube_api_key, sheets_exporter=exporter)
+                    
+                    # Check API quota before starting
+                    quota_available, quota_message = collector.check_quota_available()
+                    
+                    if not quota_available:
+                        st.error(f"❌ Cannot start collection: {quota_message}")
+                        st.info("💡 Tips:\n- Wait until midnight PT for quota reset\n- Use a different API key\n- Check your Google Cloud Console for quota status")
+                        st.session_state.is_collecting = False
+                        st.stop()
+                    else:
+                        st.success(f"✅ {quota_message} - Starting collection...")
                     
                     # Progress bar
                     progress_bar = st.progress(0)
