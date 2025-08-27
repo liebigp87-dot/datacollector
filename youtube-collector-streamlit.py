@@ -457,22 +457,31 @@ class YouTubeCollector:
         """Main collection logic"""
         collected = []
         
-        # Load existing video IDs and used queries from sheet if connected
-        if spreadsheet_id and self.sheets_exporter:
-            self.existing_sheet_ids = self.load_existing_sheet_ids(spreadsheet_id)
-            self.existing_queries = self.load_used_queries(spreadsheet_id)
-            st.session_state.used_queries.update(self.existing_queries)
-        
-        # Determine categories to use
-        if category == 'mixed':
-            categories = ['heartwarming', 'funny', 'traumatic']
-        else:
-            categories = [category]
-        
-        category_index = 0
-        attempts = 0
-        max_attempts = 30  # Increased for more query variety
-        videos_checked_ids = set()  # Track checked videos to avoid rechecking
+        try:
+            # Load existing video IDs and used queries from sheet if connected
+            if spreadsheet_id and self.sheets_exporter:
+                try:
+                    self.existing_sheet_ids = self.load_existing_sheet_ids(spreadsheet_id)
+                    self.existing_queries = self.load_used_queries(spreadsheet_id)
+                    st.session_state.used_queries.update(self.existing_queries)
+                except Exception as e:
+                    self.add_log(f"Warning: Could not load existing data from sheet: {str(e)}", "WARNING")
+                    # Continue anyway with empty sets
+                    self.existing_sheet_ids = set()
+                    self.existing_queries = set()
+            
+            # Determine categories to use
+            if category == 'mixed':
+                categories = ['heartwarming', 'funny', 'traumatic']
+            else:
+                categories = [category]
+            
+            self.add_log(f"Starting collection for category: {category}, target: {target_count} videos", "INFO")
+            
+            category_index = 0
+            attempts = 0
+            max_attempts = 30  # Increased for more query variety
+            videos_checked_ids = set()  # Track checked videos to avoid rechecking
         
         while len(collected) < target_count and attempts < max_attempts:
             current_category = categories[category_index % len(categories)]
@@ -853,55 +862,58 @@ def main():
                             st.error(f"❌ Cannot start collection: {quota_message}")
                             st.info("💡 Tips:\n- Wait until midnight PT for quota reset\n- Use a different API key\n- Check your Google Cloud Console for quota status\n- Try enabling 'Skip quota check' if this is a false positive")
                             st.session_state.is_collecting = False
-                            st.stop()
                         else:
                             st.success(f"✅ {quota_message} - Starting collection...")
                     else:
                         st.warning("⚠️ Skipping quota check - proceeding directly to collection")
                         collector.add_log("Quota check skipped by user", "INFO")
+                        quota_available = True  # Set to true when skipping
                     
-                    # Progress bar
-                    progress_bar = st.progress(0)
-                    status_text = st.empty()
-                    
-                    def update_progress(current, total):
-                        progress = current / total
-                        progress_bar.progress(progress)
-                        status_text.text(f"Collecting: {current}/{total} videos")
-                    
-                    # Get spreadsheet ID if using existing sheet
-                    sheet_id = None
-                    if use_existing and spreadsheet_id:
-                        sheet_id = spreadsheet_id
-                    
-                    # Run collection
-                    with st.spinner(f"Collecting {target_count} videos..."):
-                        videos = collector.collect_videos(
-                            target_count=target_count,
-                            category=category,
-                            spreadsheet_id=sheet_id,
-                            progress_callback=update_progress
-                        )
-                    
-                    st.success(f"✅ Collection complete! Found {len(videos)} videos.")
-                    
-                    # Auto-export if enabled
-                    if auto_export and sheets_creds and videos:
-                        try:
-                            exporter = GoogleSheetsExporter(sheets_creds)
-                            # Check if using existing sheet
-                            if use_existing and spreadsheet_id:
-                                sheet_url = exporter.export_to_sheets(videos, spreadsheet_id=spreadsheet_id)
-                            else:
-                                sheet_url = exporter.export_to_sheets(videos, spreadsheet_name=spreadsheet_name)
-                            if sheet_url:
-                                st.success(f"✅ Exported to Google Sheets!")
-                                st.markdown(f"📊 [Open Spreadsheet]({sheet_url})")
-                                collector.add_log(f"Exported to Google Sheets: {sheet_url}", "SUCCESS")
-                        except Exception as e:
-                            st.error(f"❌ Export failed: {str(e)}")
-                            st.error("Make sure you've shared the sheet with the service account email!")
-                            collector.add_log(f"Export error: {str(e)}", "ERROR")
+                    # Only proceed if quota is available or check was skipped
+                    if quota_available or skip_quota_check:
+                        # Progress bar
+                        progress_bar = st.progress(0)
+                        status_text = st.empty()
+                        
+                        def update_progress(current, total):
+                            progress = current / total
+                            progress_bar.progress(progress)
+                            status_text.text(f"Collecting: {current}/{total} videos")
+                        
+                        # Get spreadsheet ID if using existing sheet
+                        sheet_id = None
+                        if use_existing and spreadsheet_id:
+                            sheet_id = spreadsheet_id
+                        
+                        # Run collection
+                        with st.spinner(f"Collecting {target_count} videos..."):
+                            videos = collector.collect_videos(
+                                target_count=target_count,
+                                category=category,
+                                spreadsheet_id=sheet_id,
+                                progress_callback=update_progress
+                            )
+                        
+                        st.success(f"✅ Collection complete! Found {len(videos)} videos.")
+                        
+                        # Auto-export if enabled
+                        if auto_export and sheets_creds and videos:
+                            try:
+                                if not exporter:
+                                    exporter = GoogleSheetsExporter(sheets_creds)
+                                # Check if using existing sheet
+                                if use_existing and spreadsheet_id:
+                                    sheet_url = exporter.export_to_sheets(videos, spreadsheet_id=spreadsheet_id)
+                                else:
+                                    sheet_url = exporter.export_to_sheets(videos, spreadsheet_name=spreadsheet_name)
+                                if sheet_url:
+                                    st.success(f"✅ Exported to Google Sheets!")
+                                    st.markdown(f"📊 [Open Spreadsheet]({sheet_url})")
+                                    collector.add_log(f"Exported to Google Sheets: {sheet_url}", "SUCCESS")
+                            except Exception as e:
+                                st.error(f"❌ Export failed: {str(e)}")
+                                st.error("Make sure you've shared the sheet with the service account email!")
+                                collector.add_log(f"Export error: {str(e)}", "ERROR")
                 
                 except Exception as e:
                     st.error(f"❌ Collection error: {str(e)}")
