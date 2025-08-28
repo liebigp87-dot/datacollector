@@ -1565,6 +1565,9 @@ def main():
                     st.session_state.is_collecting = True
                     st.session_state.collector_stats = {'checked': 0, 'found': 0, 'rejected': 0, 'api_calls': 0, 'has_captions': 0, 'no_captions': 0}
                     
+                    # Initialize videos variable to prevent NoneType errors
+                    videos = []
+                    
                     try:
                         exporter = None
                         if sheets_creds:
@@ -1574,6 +1577,7 @@ def main():
                                 set_status('error', f"COLLECTION ABORTED: Google Sheets connection failed - {str(e)}")
                                 st.session_state.is_collecting = False
                                 st.rerun()
+                                return
                         
                         collector = YouTubeCollector(youtube_api_key, sheets_exporter=exporter)
                         
@@ -1584,6 +1588,7 @@ def main():
                                 set_status('error', f"COLLECTION ABORTED: {quota_message}")
                                 st.session_state.is_collecting = False
                                 st.rerun()
+                                return
                             else:
                                 set_status('info', f"COLLECTION STARTED: {quota_message}")
                         else:
@@ -1617,6 +1622,14 @@ def main():
                                     videos = []  # Ensure videos is always a list
                                     collector.add_log(f"Collection exception caught: {str(e)}", "ERROR")
                                     set_status('error', f"COLLECTION ERROR: {str(e)}")
+                                    st.session_state.is_collecting = False
+                                    st.rerun()
+                                    return
+                            
+                            # Verify videos is still valid before using len()
+                            if videos is None:
+                                videos = []
+                                collector.add_log("Videos became None after collection", "ERROR")
                             
                             if len(videos) > 0:
                                 set_status('info', f"COLLECTION COMPLETED: Found {len(videos)} videos")
