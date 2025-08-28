@@ -113,18 +113,6 @@ if 'analysis_history' not in st.session_state:
     st.session_state.analysis_history = []
 if 'system_status' not in st.session_state:
     st.session_state.system_status = {'type': None, 'message': ''}
-if 'auto_mode_enabled' not in st.session_state:
-    st.session_state.auto_mode_enabled = False
-if 'auto_mode_running' not in st.session_state:
-    st.session_state.auto_mode_running = False
-if 'auto_mode_stats' not in st.session_state:
-    st.session_state.auto_mode_stats = {'collections_completed': 0, 'last_check': 0, 'next_check': 0}
-if 'target_mode_enabled' not in st.session_state:
-    st.session_state.target_mode_enabled = False
-if 'target_videos' not in st.session_state:
-    st.session_state.target_videos = 10
-if 'target_progress' not in st.session_state:
-    st.session_state.target_progress = 0
 
 def show_status_alert():
     """Display system status alerts prominently"""
@@ -135,8 +123,6 @@ def show_status_alert():
             st.warning(f"⚠️ {st.session_state.system_status['message']}")
         elif st.session_state.system_status['type'] == 'info':
             st.info(f"ℹ️ {st.session_state.system_status['message']}")
-        elif st.session_state.system_status['type'] == 'success':
-            st.success(f"✅ {st.session_state.system_status['message']}")
 
 def set_status(status_type: str, message: str):
     """Set system status message"""
@@ -331,11 +317,8 @@ class GoogleSheetsExporter:
             st.error(f"Error adding to time_comments: {str(e)}")
     
     def export_to_sheets(self, videos: List[Dict], spreadsheet_id: str = None, spreadsheet_name: str = "YouTube_Collection_Data"):
-        """Export videos to raw_links sheet - simplified error handling"""
+        """Export videos to raw_links sheet"""
         try:
-            if not videos:
-                return None
-                
             if spreadsheet_id:
                 spreadsheet = self.get_spreadsheet_by_id(spreadsheet_id)
             else:
@@ -351,28 +334,28 @@ class GoogleSheetsExporter:
             except gspread.exceptions.WorksheetNotFound:
                 worksheet = spreadsheet.add_worksheet(title=worksheet_name, rows=1000, cols=20)
             
-            df = pd.DataFrame(videos)
-            existing_data = worksheet.get_all_values()
+            if videos:
+                df = pd.DataFrame(videos)
+                existing_data = worksheet.get_all_values()
+                
+                if existing_data and len(existing_data) > 1:
+                    for _, row in df.iterrows():
+                        values = [str(v) if pd.notna(v) else '' for v in row.tolist()]
+                        worksheet.append_row(values)
+                else:
+                    worksheet.clear()
+                    headers = list(df.columns)
+                    worksheet.append_row(headers)
+                    for _, row in df.iterrows():
+                        values = [str(v) if pd.notna(v) else '' for v in row.tolist()]
+                        worksheet.append_row(values)
+                
+                return spreadsheet.url
             
-            if existing_data and len(existing_data) > 1:
-                # Append to existing data
-                for _, row in df.iterrows():
-                    values = [str(v) if pd.notna(v) else '' for v in row.tolist()]
-                    worksheet.append_row(values)
-            else:
-                # Create new sheet with headers
-                worksheet.clear()
-                headers = list(df.columns)
-                worksheet.append_row(headers)
-                for _, row in df.iterrows():
-                    values = [str(v) if pd.notna(v) else '' for v in row.tolist()]
-                    worksheet.append_row(values)
-            
-            return spreadsheet.url
-            
-        except Exception as e:
-            st.error(f"Google Sheets export failed: {str(e)}")
             return None
+        except Exception as e:
+            st.error(f"Error exporting to sheets: {str(e)}")
+            raise e
 
 
 class YouTubeCollector:
@@ -441,7 +424,7 @@ class YouTubeCollector:
         timestamp = datetime.now().strftime("%H:%M:%S")
         log_entry = f"[{timestamp}] COLLECTOR {log_type}: {message}"
         st.session_state.logs.insert(0, log_entry)
-        st.session_state.logs = st.session_state.logs[:100]
+        st.session_state.logs = st.session_state.logs[:100]  # Keep more logs for debugging
     
     def check_quota_available(self) -> Tuple[bool, str]:
         """Check if YouTube API quota is available"""
@@ -869,62 +852,6 @@ class YouTubeCollector:
             time.sleep(1.5)
         
         return collected
-    
-    def run_auto_collection(self, api_key: str, sheets_exporter, spreadsheet_id: str):
-        """Run auto collection cycle - simplified for reliability"""
-        current_time = time.time()
-        
-        # Check if an hour has passed since last check
-        if (st.session_state.auto_mode_stats['last_check'] == 0 or 
-            current_time - st.session_state.auto_mode_stats['last_check'] >= 3600):
-            
-            st.session_state.auto_mode_stats['last_check'] = current_time
-            st.session_state.auto_mode_stats['next_check'] = current_time + 3600
-            
-            try:
-                self.add_log("AUTO MODE: Starting collection cycle", "INFO")
-                
-                # Quick quota check
-                quota_available, _ = self.check_quota_available()
-                if not quota_available:
-                    set_status('warning', "AUTO MODE: Waiting for quota refresh")
-                    return True
-                
-                # Run collection
-                videos = self.collect_videos(
-                    target_count=10,
-                    category='mixed',
-                    spreadsheet_id=spreadsheet_id,
-                    require_captions=True,
-                    progress_callback=None
-                )
-                
-                if videos and len(videos) > 0:
-                    # Export to sheets
-                    sheet_url = sheets_exporter.export_to_sheets(videos, spreadsheet_id=spreadsheet_id)
-                    if sheet_url:
-                        st.session_state.auto_mode_stats['collections_completed'] += 1
-                        self.add_log(f"AUTO MODE: Collection #{st.session_state.auto_mode_stats['collections_completed']} completed - {len(videos)} videos", "SUCCESS")
-                        set_status('success', f"AUTO MODE: Collection #{st.session_state.auto_mode_stats['collections_completed']} completed with {len(videos)} videos")
-                        
-                        # Check if we can do another immediate run
-                        quota_available, _ = self.check_quota_available()
-                        if quota_available:
-                            st.session_state.auto_mode_stats['last_check'] = 0  # Reset for immediate next run
-                    else:
-                        set_status('warning', "AUTO MODE: Collection completed but export failed")
-                else:
-                    self.add_log("AUTO MODE: No videos collected this cycle", "INFO")
-                    set_status('info', "AUTO MODE: No videos found this cycle")
-                
-                return True
-                
-            except Exception as e:
-                self.add_log(f"AUTO MODE ERROR: {str(e)}", "ERROR")
-                set_status('error', f"AUTO MODE ERROR: {str(e)}")
-                return False
-        
-        return True
 
 
 class VideoRater:
@@ -938,7 +865,7 @@ class VideoRater:
         timestamp = datetime.now().strftime("%H:%M:%S")
         log_entry = f"[{timestamp}] RATER {log_type}: {message}"
         st.session_state.logs.insert(0, log_entry)
-        st.session_state.logs = st.session_state.logs[:100]
+        st.session_state.logs = st.session_state.logs[:100]  # Keep more logs for debugging
     
     def check_quota_available(self) -> Tuple[bool, str]:
         """Check if YouTube API quota is available"""
@@ -1443,61 +1370,6 @@ def main():
                 "Require captions",
                 value=True
             )
-            
-            st.divider()
-            
-            # Auto Mode section
-            st.subheader("🤖 Auto Mode")
-            
-            auto_mode_enabled = st.checkbox(
-                "Enable Auto Mode",
-                value=st.session_state.auto_mode_enabled,
-                disabled=st.session_state.auto_mode_running or st.session_state.is_collecting,
-                help="Automatically collect videos every hour (mixed category, 10 videos)"
-            )
-            
-            if auto_mode_enabled != st.session_state.auto_mode_enabled:
-                st.session_state.auto_mode_enabled = auto_mode_enabled
-                if not auto_mode_enabled:
-                    st.session_state.auto_mode_running = False
-                st.rerun()
-            
-            if st.session_state.auto_mode_enabled:
-                # Auto mode status
-                if st.session_state.auto_mode_running:
-                    next_check_time = st.session_state.auto_mode_stats.get('next_check', 0)
-                    if next_check_time > 0:
-                        remaining_minutes = max(0, int((next_check_time - time.time()) / 60))
-                        st.info(f"⏰ Next check: {remaining_minutes} minutes")
-                    
-                    collections = st.session_state.auto_mode_stats.get('collections_completed', 0)
-                    st.info(f"📊 Collections completed: {collections}")
-                    
-                    if st.button("⏹️ Stop Auto Mode", type="secondary"):
-                        st.session_state.auto_mode_running = False
-                        set_status('warning', "AUTO MODE STOPPED: Process terminated by user")
-                        st.rerun()
-                else:
-                    # Auto mode controls
-                    col1, col2 = st.columns([2, 1])
-                    
-                    with col1:
-                        if st.button("▶️ Start Auto Mode", 
-                                    disabled=not youtube_api_key or not sheets_creds or not spreadsheet_id,
-                                    type="primary"):
-                            st.session_state.auto_mode_running = True
-                            st.session_state.auto_mode_stats = {'collections_completed': 0, 'last_check': 0, 'next_check': 0}
-                            set_status('info', "AUTO MODE STARTED: Will perform first check shortly")
-                            st.rerun()
-                    
-                    with col2:
-                        if st.button("🔄", help="Reset Auto Mode", type="secondary"):
-                            st.session_state.auto_mode_running = False
-                            st.session_state.auto_mode_enabled = False
-                            st.session_state.is_collecting = False
-                            clear_status()
-                            st.success("Auto mode reset")
-                            st.rerun()
         
         # Statistics display
         col1, col2, col3 = st.columns(3)
@@ -1513,31 +1385,31 @@ def main():
         col1, col2, col3, col4 = st.columns(4)
         
         with col1:
-            if st.button("Start Collection", 
-                        disabled=st.session_state.is_collecting or st.session_state.auto_mode_running, 
-                        type="primary"):
-                clear_status()
+            if st.button("Start Collection", disabled=st.session_state.is_collecting, type="primary"):
+                clear_status()  # Clear any previous status
                 
                 if not youtube_api_key:
                     set_status('error', "COLLECTION ABORTED: YouTube API key required")
+                    st.rerun()
                 elif not sheets_creds and auto_export:
                     set_status('error', "COLLECTION ABORTED: Google Sheets credentials required for auto-export")
+                    st.rerun()
                 else:
                     st.session_state.is_collecting = True
                     st.session_state.collector_stats = {'checked': 0, 'found': 0, 'rejected': 0, 'api_calls': 0, 'has_captions': 0, 'no_captions': 0}
                     
-                    videos = []  # Initialize to avoid None issues
-                    
                     try:
-                        # Create exporter if needed
                         exporter = None
                         if sheets_creds:
-                            exporter = GoogleSheetsExporter(sheets_creds)
+                            try:
+                                exporter = GoogleSheetsExporter(sheets_creds)
+                            except Exception as e:
+                                set_status('error', f"COLLECTION ABORTED: Google Sheets connection failed - {str(e)}")
+                                st.session_state.is_collecting = False
+                                st.rerun()
                         
-                        # Create collector
                         collector = YouTubeCollector(youtube_api_key, sheets_exporter=exporter)
                         
-                        # Quota check
                         quota_available = True
                         if not skip_quota_check:
                             quota_available, quota_message = collector.check_quota_available()
@@ -1550,7 +1422,6 @@ def main():
                         else:
                             set_status('info', "COLLECTION STARTED: API quota check skipped")
                         
-                        # Collection phase
                         if quota_available:
                             progress_bar = st.progress(0)
                             status_text = st.empty()
@@ -1569,63 +1440,56 @@ def main():
                                     progress_callback=update_progress
                                 )
                             
-                            # Ensure videos is always a list
-                            if videos is None:
-                                videos = []
-                            
                             if len(videos) > 0:
-                                set_status('success', f"COLLECTION COMPLETED: Found {len(videos)} videos")
+                                set_status('info', f"COLLECTION COMPLETED: Found {len(videos)} videos")
                             else:
                                 set_status('warning', "COLLECTION COMPLETED: No videos found")
                             
-                            # Export phase - ALWAYS TRY IF THERE ARE VIDEOS TO EXPORT
-                            if auto_export and sheets_creds and videos and len(videos) > 0:
+                            if auto_export and sheets_creds and videos:
                                 try:
-                                    collector.add_log(f"Starting export of {len(videos)} videos to Google Sheets", "INFO")
+                                    collector.add_log(f"Starting auto-export of {len(videos)} videos to Google Sheets", "INFO")
+                                    if not exporter:
+                                        exporter = GoogleSheetsExporter(sheets_creds)
+                                        collector.add_log("Initialized Google Sheets exporter", "INFO")
+                                    
+                                    collector.add_log(f"Attempting to export to spreadsheet ID: {spreadsheet_id}", "INFO")
                                     sheet_url = exporter.export_to_sheets(videos, spreadsheet_id=spreadsheet_id)
                                     
                                     if sheet_url:
-                                        st.success("✅ Exported to Google Sheets!")
+                                        st.success("Exported to Google Sheets!")
                                         st.markdown(f"[Open Spreadsheet]({sheet_url})")
-                                        collector.add_log(f"EXPORT SUCCESS: {len(videos)} videos exported", "SUCCESS")
-                                        set_status('success', f"EXPORT SUCCESS: {len(videos)} videos exported to raw_links")
+                                        collector.add_log(f"EXPORT SUCCESS: {len(videos)} videos exported to raw_links sheet", "SUCCESS")
+                                        collector.add_log(f"Spreadsheet URL: {sheet_url}", "INFO")
+                                        set_status('info', f"EXPORT SUCCESS: {len(videos)} videos exported to raw_links")
                                     else:
-                                        collector.add_log("EXPORT FAILED: No URL returned", "ERROR")
-                                        set_status('error', "EXPORT FAILED: Could not get spreadsheet URL")
+                                        collector.add_log("EXPORT FAILED: No spreadsheet URL returned", "ERROR")
+                                        set_status('error', "EXPORT FAILED: No spreadsheet URL returned")
                                         
                                 except Exception as e:
                                     error_msg = str(e)
                                     collector.add_log(f"EXPORT ERROR: {error_msg}", "ERROR")
                                     set_status('error', f"EXPORT FAILED: {error_msg}")
+                                    
+                                    # Additional error details
+                                    if "authentication" in error_msg.lower():
+                                        collector.add_log("Check Google Sheets service account credentials", "ERROR")
+                                    elif "permission" in error_msg.lower():
+                                        collector.add_log("Check if service account has write access to spreadsheet", "ERROR")
+                                    elif "spreadsheet" in error_msg.lower():
+                                        collector.add_log("Check if spreadsheet ID is correct and accessible", "ERROR")
+                            else:
+                                if not auto_export:
+                                    collector.add_log("Auto-export disabled - videos collected but not exported", "INFO")
+                                elif not sheets_creds:
+                                    collector.add_log("No Google Sheets credentials - cannot export", "WARNING")
+                                elif not videos:
+                                    collector.add_log("No videos collected - nothing to export", "INFO")
                     
                     except Exception as e:
                         set_status('error', f"COLLECTION FAILED: {str(e)}")
                     finally:
                         st.session_state.is_collecting = False
-                
-                st.rerun()
-        
-        # Auto mode monitoring - simplified and non-blocking
-        if (st.session_state.auto_mode_running and 
-            not st.session_state.is_collecting and 
-            st.session_state.auto_mode_enabled and
-            youtube_api_key and sheets_creds and spreadsheet_id):
-            
-            try:
-                exporter = GoogleSheetsExporter(sheets_creds)
-                collector = YouTubeCollector(youtube_api_key, sheets_exporter=exporter)
-                
-                # Run auto collection check
-                continue_auto = collector.run_auto_collection(youtube_api_key, exporter, spreadsheet_id)
-                
-                if not continue_auto:
-                    st.session_state.auto_mode_running = False
-                    st.rerun()
-                    
-            except Exception as e:
-                set_status('error', f"AUTO MODE ERROR: {str(e)}")
-                st.session_state.auto_mode_running = False
-                st.rerun()
+                        st.rerun()
         
         with col2:
             if st.button("Stop", disabled=not st.session_state.is_collecting):
@@ -1637,7 +1501,6 @@ def main():
             if st.button("Reset"):
                 st.session_state.collected_videos = []
                 st.session_state.collector_stats = {'checked': 0, 'found': 0, 'rejected': 0, 'api_calls': 0, 'has_captions': 0, 'no_captions': 0}
-                clear_status()
                 st.rerun()
         
         with col4:
@@ -1654,8 +1517,6 @@ def main():
                         if sheet_url:
                             st.success("Exported to Google Sheets!")
                             st.markdown(f"[Open Spreadsheet]({sheet_url})")
-                        else:
-                            st.error("Export failed - no URL returned")
                     except Exception as e:
                         st.error(f"Export failed: {str(e)}")
         
@@ -1676,39 +1537,6 @@ def main():
         # Show status alerts prominently
         show_status_alert()
         
-        # Target Mode Configuration
-        with st.sidebar:
-            st.subheader("Target Mode")
-            
-            target_mode_enabled = st.checkbox(
-                "Enable Target Mode",
-                value=st.session_state.target_mode_enabled,
-                help="Process videos until reaching target number of tobe_links"
-            )
-            
-            if target_mode_enabled != st.session_state.target_mode_enabled:
-                st.session_state.target_mode_enabled = target_mode_enabled
-                if not target_mode_enabled:
-                    st.session_state.target_progress = 0
-                st.rerun()
-            
-            if st.session_state.target_mode_enabled:
-                target_videos = st.number_input(
-                    "Target Videos for tobe_links",
-                    min_value=1,
-                    max_value=100,
-                    value=st.session_state.target_videos
-                )
-                
-                if target_videos != st.session_state.target_videos:
-                    st.session_state.target_videos = target_videos
-                    st.session_state.target_progress = 0
-                
-                # Show target progress
-                if st.session_state.target_progress > 0:
-                    progress_pct = min(st.session_state.target_progress / st.session_state.target_videos, 1.0)
-                    st.progress(progress_pct, f"Progress: {st.session_state.target_progress}/{st.session_state.target_videos}")
-        
         # Statistics display
         col1, col2, col3 = st.columns(3)
         
@@ -1728,20 +1556,13 @@ def main():
             with col1:
                 if st.button("Start Rating", disabled=st.session_state.is_rating, type="primary"):
                     clear_status()
-                    if st.session_state.target_mode_enabled:
-                        set_status('info', f"TARGET MODE STARTED: Processing until {st.session_state.target_videos} videos reach tobe_links")
-                        st.session_state.target_progress = 0
-                    else:
-                        set_status('info', "RATING STARTED: Processing videos from raw_links")
+                    set_status('info', "RATING STARTED: Processing videos from raw_links")
                     st.session_state.is_rating = True
                     st.rerun()
             
             with col2:
                 if st.button("Stop Rating", disabled=not st.session_state.is_rating):
-                    if st.session_state.target_mode_enabled:
-                        set_status('warning', f"TARGET MODE STOPPED: {st.session_state.target_progress}/{st.session_state.target_videos} completed before stopping")
-                    else:
-                        set_status('warning', "RATING STOPPED: Process terminated by user")
+                    set_status('warning', "RATING STOPPED: Process terminated by user")
                     st.session_state.is_rating = False
                     st.rerun()
             
@@ -1752,21 +1573,11 @@ def main():
                     
                     # Continuous rating loop
                     while st.session_state.is_rating:
-                        # Check if target reached in target mode
-                        if st.session_state.target_mode_enabled and st.session_state.target_progress >= st.session_state.target_videos:
-                            set_status('success', f"TARGET REACHED: {st.session_state.target_progress} videos successfully moved to tobe_links")
-                            st.session_state.is_rating = False
-                            st.rerun()
-                            break
-                        
                         # Check quota before each video
                         quota_available, quota_message = rater.check_quota_available()
                         
                         if not quota_available:
-                            if st.session_state.target_mode_enabled:
-                                set_status('error', f"TARGET MODE ABORTED: {quota_message} - {st.session_state.target_progress}/{st.session_state.target_videos} completed")
-                            else:
-                                set_status('error', f"RATING ABORTED: {quota_message}")
+                            set_status('error', f"RATING ABORTED: {quota_message}")
                             st.session_state.is_rating = False
                             st.rerun()
                             break
@@ -1775,13 +1586,7 @@ def main():
                         next_video = exporter.get_next_raw_video(spreadsheet_id)
                         
                         if not next_video:
-                            if st.session_state.target_mode_enabled:
-                                if st.session_state.target_progress >= st.session_state.target_videos:
-                                    set_status('success', f"TARGET REACHED: {st.session_state.target_progress} videos moved to tobe_links")
-                                else:
-                                    set_status('warning', f"TARGET NOT REACHED: {st.session_state.target_progress}/{st.session_state.target_videos} - No more videos available")
-                            else:
-                                set_status('info', "RATING COMPLETED: All videos processed - no more videos in raw_links")
+                            set_status('info', "RATING COMPLETED: All videos processed - no more videos in raw_links")
                             st.session_state.is_rating = False
                             st.rerun()
                             break
@@ -1867,14 +1672,7 @@ def main():
                                         )
                                         
                                         st.session_state.rater_stats['moved_to_tobe'] += 1
-                                        
-                                        # Update target progress if in target mode
-                                        if st.session_state.target_mode_enabled:
-                                            st.session_state.target_progress += 1
-                                            st.success(f"✅ Score: {score:.1f}/10 - Moved to tobe_links! ({st.session_state.target_progress}/{st.session_state.target_videos})")
-                                        else:
-                                            st.success(f"✅ Score: {score:.1f}/10 - Moved to tobe_links!")
-                                        
+                                        st.success(f"✅ Score: {score:.1f}/10 - Moved to tobe_links!")
                                         rater.add_log(f"Video {next_video.get('title', '')[:50]} scored {score:.1f} - moved to tobe_links and time_comments", "SUCCESS")
                                     else:
                                         st.info(f"ℹ️ Score: {score:.1f}/10 - Below threshold, removed from raw_links.")
