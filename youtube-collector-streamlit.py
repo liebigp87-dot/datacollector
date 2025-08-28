@@ -333,6 +333,9 @@ class GoogleSheetsExporter:
     def export_to_sheets(self, videos: List[Dict], spreadsheet_id: str = None, spreadsheet_name: str = "YouTube_Collection_Data"):
         """Export videos to raw_links sheet"""
         try:
+            if not videos:
+                return None
+                
             if spreadsheet_id:
                 spreadsheet = self.get_spreadsheet_by_id(spreadsheet_id)
             else:
@@ -353,10 +356,12 @@ class GoogleSheetsExporter:
                 existing_data = worksheet.get_all_values()
                 
                 if existing_data and len(existing_data) > 1:
+                    # Append to existing data
                     for _, row in df.iterrows():
                         values = [str(v) if pd.notna(v) else '' for v in row.tolist()]
                         worksheet.append_row(values)
                 else:
+                    # Create new sheet with headers
                     worksheet.clear()
                     headers = list(df.columns)
                     worksheet.append_row(headers)
@@ -367,9 +372,9 @@ class GoogleSheetsExporter:
                 return spreadsheet.url
             
             return None
+            
         except Exception as e:
-            st.error(f"Error exporting to sheets: {str(e)}")
-            raise e
+            raise Exception(f"Google Sheets export failed: {str(e)}")
 
 
 class YouTubeCollector:
