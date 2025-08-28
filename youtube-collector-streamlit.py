@@ -1623,7 +1623,7 @@ def main():
                             else:
                                 set_status('warning', "COLLECTION COMPLETED: No videos found")
                             
-                            if auto_export and sheets_creds and videos:
+                            if auto_export and sheets_creds and videos and len(videos) > 0:
                                 try:
                                     collector.add_log(f"Starting auto-export of {len(videos)} videos to Google Sheets", "INFO")
                                     if not exporter:
@@ -1655,18 +1655,28 @@ def main():
                                         collector.add_log("Check if service account has write access to spreadsheet", "ERROR")
                                     elif "spreadsheet" in error_msg.lower():
                                         collector.add_log("Check if spreadsheet ID is correct and accessible", "ERROR")
+                            elif videos is None:
+                                collector.add_log("Cannot export: videos is None", "ERROR")
+                                set_status('error', "EXPORT FAILED: Collection returned None")
+                            elif not videos:
+                                collector.add_log("No videos collected - nothing to export", "INFO")
                             else:
                                 if not auto_export:
                                     collector.add_log("Auto-export disabled - videos collected but not exported", "INFO")
                                 elif not sheets_creds:
                                     collector.add_log("No Google Sheets credentials - cannot export", "WARNING")
-                                elif not videos:
-                                    collector.add_log("No videos collected - nothing to export", "INFO")
                     
                     except Exception as e:
+                        collector.add_log(f"CRITICAL ERROR in collection process: {str(e)}", "ERROR")
                         set_status('error', f"COLLECTION FAILED: {str(e)}")
+                        videos = []  # Ensure videos is never None
                     finally:
                         st.session_state.is_collecting = False
+                        # Debug logging
+                        if 'videos' in locals():
+                            collector.add_log(f"Final videos variable type: {type(videos)}, value: {videos}", "INFO")
+                        else:
+                            collector.add_log("Videos variable not defined at end of collection", "ERROR")
                         st.rerun()
         
         # Auto mode monitoring - non-blocking with error handling
