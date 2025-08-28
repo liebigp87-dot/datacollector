@@ -125,8 +125,6 @@ if 'target_videos' not in st.session_state:
     st.session_state.target_videos = 10
 if 'target_progress' not in st.session_state:
     st.session_state.target_progress = 0
-if 'auto_mode_error_count' not in st.session_state:
-    st.session_state.auto_mode_error_count = 0
 
 def show_status_alert():
     """Display system status alerts prominently"""
@@ -137,6 +135,8 @@ def show_status_alert():
             st.warning(f"⚠️ {st.session_state.system_status['message']}")
         elif st.session_state.system_status['type'] == 'info':
             st.info(f"ℹ️ {st.session_state.system_status['message']}")
+        elif st.session_state.system_status['type'] == 'success':
+            st.success(f"✅ {st.session_state.system_status['message']}")
 
 def set_status(status_type: str, message: str):
     """Set system status message"""
@@ -331,7 +331,7 @@ class GoogleSheetsExporter:
             st.error(f"Error adding to time_comments: {str(e)}")
     
     def export_to_sheets(self, videos: List[Dict], spreadsheet_id: str = None, spreadsheet_name: str = "YouTube_Collection_Data"):
-        """Export videos to raw_links sheet"""
+        """Export videos to raw_links sheet - simplified error handling"""
         try:
             if not videos:
                 return None
@@ -351,30 +351,28 @@ class GoogleSheetsExporter:
             except gspread.exceptions.WorksheetNotFound:
                 worksheet = spreadsheet.add_worksheet(title=worksheet_name, rows=1000, cols=20)
             
-            if videos:
-                df = pd.DataFrame(videos)
-                existing_data = worksheet.get_all_values()
-                
-                if existing_data and len(existing_data) > 1:
-                    # Append to existing data
-                    for _, row in df.iterrows():
-                        values = [str(v) if pd.notna(v) else '' for v in row.tolist()]
-                        worksheet.append_row(values)
-                else:
-                    # Create new sheet with headers
-                    worksheet.clear()
-                    headers = list(df.columns)
-                    worksheet.append_row(headers)
-                    for _, row in df.iterrows():
-                        values = [str(v) if pd.notna(v) else '' for v in row.tolist()]
-                        worksheet.append_row(values)
-                
-                return spreadsheet.url
+            df = pd.DataFrame(videos)
+            existing_data = worksheet.get_all_values()
             
-            return None
+            if existing_data and len(existing_data) > 1:
+                # Append to existing data
+                for _, row in df.iterrows():
+                    values = [str(v) if pd.notna(v) else '' for v in row.tolist()]
+                    worksheet.append_row(values)
+            else:
+                # Create new sheet with headers
+                worksheet.clear()
+                headers = list(df.columns)
+                worksheet.append_row(headers)
+                for _, row in df.iterrows():
+                    values = [str(v) if pd.notna(v) else '' for v in row.tolist()]
+                    worksheet.append_row(values)
+            
+            return spreadsheet.url
             
         except Exception as e:
-            raise Exception(f"Google Sheets export failed: {str(e)}")
+            st.error(f"Google Sheets export failed: {str(e)}")
+            return None
 
 
 class YouTubeCollector:
@@ -443,7 +441,7 @@ class YouTubeCollector:
         timestamp = datetime.now().strftime("%H:%M:%S")
         log_entry = f"[{timestamp}] COLLECTOR {log_type}: {message}"
         st.session_state.logs.insert(0, log_entry)
-        st.session_state.logs = st.session_state.logs[:100]  # Keep more logs for debugging
+        st.session_state.logs = st.session_state.logs[:100]
     
     def check_quota_available(self) -> Tuple[bool, str]:
         """Check if YouTube API quota is available"""
@@ -870,90 +868,61 @@ class YouTubeCollector:
             attempts += 1
             time.sleep(1.5)
         
-    def check_auto_mode_safe(self, api_key: str, sheets_exporter=None, spreadsheet_id: str = None):
-        """Safely check and execute auto mode without blocking UI"""
-        try:
-            current_time = time.time()
+        return collected
+    
+    def run_auto_collection(self, api_key: str, sheets_exporter, spreadsheet_id: str):
+        """Run auto collection cycle - simplified for reliability"""
+        current_time = time.time()
+        
+        # Check if an hour has passed since last check
+        if (st.session_state.auto_mode_stats['last_check'] == 0 or 
+            current_time - st.session_state.auto_mode_stats['last_check'] >= 3600):
             
-            # Check if an hour has passed since last check or this is first run
-            if (st.session_state.auto_mode_stats['last_check'] == 0 or 
-                current_time - st.session_state.auto_mode_stats['last_check'] >= 3600):
+            st.session_state.auto_mode_stats['last_check'] = current_time
+            st.session_state.auto_mode_stats['next_check'] = current_time + 3600
+            
+            try:
+                self.add_log("AUTO MODE: Starting collection cycle", "INFO")
                 
-                # Update check time first
-                st.session_state.auto_mode_stats['last_check'] = current_time
-                st.session_state.auto_mode_stats['next_check'] = current_time + 3600
+                # Quick quota check
+                quota_available, _ = self.check_quota_available()
+                if not quota_available:
+                    set_status('warning', "AUTO MODE: Waiting for quota refresh")
+                    return True
                 
-                self.add_log("AUTO MODE: Checking quota availability", "INFO")
+                # Run collection
+                videos = self.collect_videos(
+                    target_count=10,
+                    category='mixed',
+                    spreadsheet_id=spreadsheet_id,
+                    require_captions=True,
+                    progress_callback=None
+                )
                 
-                # Quick quota check with timeout protection
-                try:
-                    quota_available, quota_message = self.check_quota_available()
-                except Exception as e:
-                    self.add_log(f"AUTO MODE: Quota check failed - {str(e)}", "ERROR")
-                    raise Exception(f"Quota check failed: {str(e)}")
-                
-                if quota_available:
-                    self.add_log("AUTO MODE: Quota available, starting collection", "INFO")
-                    
-                    # Quick validation of requirements
-                    if not sheets_exporter:
-                        raise Exception("Google Sheets exporter not available")
-                    if not spreadsheet_id:
-                        raise Exception("Spreadsheet ID not configured")
-                    
-                    # Start collection with error handling
-                    videos = self.collect_videos(
-                        target_count=10,
-                        category='mixed',
-                        spreadsheet_id=spreadsheet_id,
-                        require_captions=True,
-                        progress_callback=None
-                    )
-                    
-                    if videos:
-                        # Export to sheets
-                        sheet_url = sheets_exporter.export_to_sheets(videos, spreadsheet_id=spreadsheet_id)
-                        if sheet_url:
-                            st.session_state.auto_mode_stats['collections_completed'] += 1
-                            st.session_state.auto_mode_error_count = 0  # Reset error count on success
-                            self.add_log(f"AUTO MODE: Collection #{st.session_state.auto_mode_stats['collections_completed']} completed - {len(videos)} videos", "SUCCESS")
-                            
-                            # Check quota for immediate next run
-                            try:
-                                quota_still_available, _ = self.check_quota_available()
-                                if quota_still_available:
-                                    st.session_state.auto_mode_stats['last_check'] = 0  # Reset for immediate next run
-                                    set_status('info', f"AUTO MODE: Collection completed, checking for next run...")
-                                    return True
-                                else:
-                                    set_status('info', f"AUTO MODE: Quota exhausted after {st.session_state.auto_mode_stats['collections_completed']} collections")
-                                    return True
-                            except Exception as e:
-                                self.add_log(f"AUTO MODE: Post-collection quota check failed - {str(e)}", "WARNING")
-                                return True  # Continue anyway
-                        else:
-                            raise Exception("Export failed - no URL returned")
+                if videos and len(videos) > 0:
+                    # Export to sheets
+                    sheet_url = sheets_exporter.export_to_sheets(videos, spreadsheet_id=spreadsheet_id)
+                    if sheet_url:
+                        st.session_state.auto_mode_stats['collections_completed'] += 1
+                        self.add_log(f"AUTO MODE: Collection #{st.session_state.auto_mode_stats['collections_completed']} completed - {len(videos)} videos", "SUCCESS")
+                        set_status('success', f"AUTO MODE: Collection #{st.session_state.auto_mode_stats['collections_completed']} completed with {len(videos)} videos")
+                        
+                        # Check if we can do another immediate run
+                        quota_available, _ = self.check_quota_available()
+                        if quota_available:
+                            st.session_state.auto_mode_stats['last_check'] = 0  # Reset for immediate next run
                     else:
-                        self.add_log("AUTO MODE: No videos collected this round", "WARNING")
-                        return True  # Continue auto mode
+                        set_status('warning', "AUTO MODE: Collection completed but export failed")
                 else:
-                    set_status('info', f"AUTO MODE: Waiting for quota refresh - {st.session_state.auto_mode_stats['collections_completed']} collections completed")
-                    return True  # Continue waiting
-                    
-        except Exception as e:
-            # Increment error count
-            st.session_state.auto_mode_error_count += 1
-            error_msg = str(e)
-            
-            # If too many errors, stop auto mode
-            if st.session_state.auto_mode_error_count >= 3:
-                set_status('error', f"AUTO MODE DISABLED: Too many failures ({st.session_state.auto_mode_error_count}) - {error_msg}")
-                st.session_state.auto_mode_running = False
-                st.session_state.auto_mode_error_count = 0
+                    self.add_log("AUTO MODE: No videos collected this cycle", "INFO")
+                    set_status('info', "AUTO MODE: No videos found this cycle")
+                
+                return True
+                
+            except Exception as e:
+                self.add_log(f"AUTO MODE ERROR: {str(e)}", "ERROR")
+                set_status('error', f"AUTO MODE ERROR: {str(e)}")
                 return False
-            else:
-                set_status('warning', f"AUTO MODE WARNING: Error #{st.session_state.auto_mode_error_count}/3 - {error_msg}")
-                return True  # Continue but with warning
         
         return True
 
@@ -969,7 +938,7 @@ class VideoRater:
         timestamp = datetime.now().strftime("%H:%M:%S")
         log_entry = f"[{timestamp}] RATER {log_type}: {message}"
         st.session_state.logs.insert(0, log_entry)
-        st.session_state.logs = st.session_state.logs[:100]  # Keep more logs for debugging
+        st.session_state.logs = st.session_state.logs[:100]
     
     def check_quota_available(self) -> Tuple[bool, str]:
         """Check if YouTube API quota is available"""
@@ -1509,36 +1478,25 @@ def main():
                         set_status('warning', "AUTO MODE STOPPED: Process terminated by user")
                         st.rerun()
                 else:
-                    # Auto mode controls with improved error handling
-                    col1, col2, col3 = st.columns([2, 2, 1])
+                    # Auto mode controls
+                    col1, col2 = st.columns([2, 1])
                     
                     with col1:
                         if st.button("▶️ Start Auto Mode", 
                                     disabled=not youtube_api_key or not sheets_creds or not spreadsheet_id,
                                     type="primary"):
-                            # Lightweight startup - defer heavy checks until first run
                             st.session_state.auto_mode_running = True
                             st.session_state.auto_mode_stats = {'collections_completed': 0, 'last_check': 0, 'next_check': 0}
-                            st.session_state.auto_mode_error_count = 0
                             set_status('info', "AUTO MODE STARTED: Will perform first check shortly")
                             st.rerun()
                     
                     with col2:
-                        if st.button("⏹️ Stop Auto Mode", type="secondary"):
-                            st.session_state.auto_mode_running = False
-                            st.session_state.auto_mode_error_count = 0
-                            set_status('warning', "AUTO MODE STOPPED: Process terminated by user")
-                            st.rerun()
-                    
-                    with col3:
-                        # Emergency reset button
-                        if st.button("🔄", help="Emergency Reset", type="secondary"):
+                        if st.button("🔄", help="Reset Auto Mode", type="secondary"):
                             st.session_state.auto_mode_running = False
                             st.session_state.auto_mode_enabled = False
-                            st.session_state.auto_mode_error_count = 0
                             st.session_state.is_collecting = False
                             clear_status()
-                            st.success("Emergency reset completed")
+                            st.success("Auto mode reset")
                             st.rerun()
         
         # Statistics display
@@ -1562,30 +1520,24 @@ def main():
                 
                 if not youtube_api_key:
                     set_status('error', "COLLECTION ABORTED: YouTube API key required")
-                    st.rerun()
                 elif not sheets_creds and auto_export:
                     set_status('error', "COLLECTION ABORTED: Google Sheets credentials required for auto-export")
-                    st.rerun()
                 else:
                     st.session_state.is_collecting = True
                     st.session_state.collector_stats = {'checked': 0, 'found': 0, 'rejected': 0, 'api_calls': 0, 'has_captions': 0, 'no_captions': 0}
                     
-                    # Initialize videos variable to prevent NoneType errors
-                    videos = []
+                    videos = []  # Initialize to avoid None issues
                     
                     try:
+                        # Create exporter if needed
                         exporter = None
                         if sheets_creds:
-                            try:
-                                exporter = GoogleSheetsExporter(sheets_creds)
-                            except Exception as e:
-                                set_status('error', f"COLLECTION ABORTED: Google Sheets connection failed - {str(e)}")
-                                st.session_state.is_collecting = False
-                                st.rerun()
-                                return
+                            exporter = GoogleSheetsExporter(sheets_creds)
                         
+                        # Create collector
                         collector = YouTubeCollector(youtube_api_key, sheets_exporter=exporter)
                         
+                        # Quota check
                         quota_available = True
                         if not skip_quota_check:
                             quota_available, quota_message = collector.check_quota_available()
@@ -1593,12 +1545,12 @@ def main():
                                 set_status('error', f"COLLECTION ABORTED: {quota_message}")
                                 st.session_state.is_collecting = False
                                 st.rerun()
-                                return
                             else:
                                 set_status('info', f"COLLECTION STARTED: {quota_message}")
                         else:
                             set_status('info', "COLLECTION STARTED: API quota check skipped")
                         
+                        # Collection phase
                         if quota_available:
                             progress_bar = st.progress(0)
                             status_text = st.empty()
@@ -1609,122 +1561,71 @@ def main():
                                 status_text.text(f"Collecting: {current}/{total} videos")
                             
                             with st.spinner(f"Collecting {target_count} videos for {category}..."):
-                                try:
-                                    videos = collector.collect_videos(
-                                        target_count=target_count,
-                                        category=category,
-                                        spreadsheet_id=spreadsheet_id,
-                                        require_captions=require_captions,
-                                        progress_callback=update_progress
-                                    )
-                                    
-                                    # Ensure videos is always a list, never None
-                                    if videos is None:
-                                        videos = []
-                                        collector.add_log("Collection returned None - converted to empty list", "WARNING")
-                                        
-                                except Exception as e:
-                                    videos = []  # Ensure videos is always a list
-                                    collector.add_log(f"Collection exception caught: {str(e)}", "ERROR")
-                                    set_status('error', f"COLLECTION ERROR: {str(e)}")
-                                    st.session_state.is_collecting = False
-                                    st.rerun()
-                                    return
+                                videos = collector.collect_videos(
+                                    target_count=target_count,
+                                    category=category,
+                                    spreadsheet_id=spreadsheet_id,
+                                    require_captions=require_captions,
+                                    progress_callback=update_progress
+                                )
                             
-                            # Verify videos is still valid before using len()
+                            # Ensure videos is always a list
                             if videos is None:
                                 videos = []
-                                collector.add_log("Videos became None after collection", "ERROR")
                             
                             if len(videos) > 0:
-                                set_status('info', f"COLLECTION COMPLETED: Found {len(videos)} videos")
+                                set_status('success', f"COLLECTION COMPLETED: Found {len(videos)} videos")
                             else:
                                 set_status('warning', "COLLECTION COMPLETED: No videos found")
                             
+                            # Export phase - ALWAYS TRY IF THERE ARE VIDEOS TO EXPORT
                             if auto_export and sheets_creds and videos and len(videos) > 0:
                                 try:
-                                    collector.add_log(f"Starting auto-export of {len(videos)} videos to Google Sheets", "INFO")
-                                    if not exporter:
-                                        exporter = GoogleSheetsExporter(sheets_creds)
-                                        collector.add_log("Initialized Google Sheets exporter", "INFO")
-                                    
-                                    collector.add_log(f"Attempting to export to spreadsheet ID: {spreadsheet_id}", "INFO")
+                                    collector.add_log(f"Starting export of {len(videos)} videos to Google Sheets", "INFO")
                                     sheet_url = exporter.export_to_sheets(videos, spreadsheet_id=spreadsheet_id)
                                     
                                     if sheet_url:
-                                        st.success("Exported to Google Sheets!")
+                                        st.success("✅ Exported to Google Sheets!")
                                         st.markdown(f"[Open Spreadsheet]({sheet_url})")
-                                        collector.add_log(f"EXPORT SUCCESS: {len(videos)} videos exported to raw_links sheet", "SUCCESS")
-                                        collector.add_log(f"Spreadsheet URL: {sheet_url}", "INFO")
-                                        set_status('info', f"EXPORT SUCCESS: {len(videos)} videos exported to raw_links")
+                                        collector.add_log(f"EXPORT SUCCESS: {len(videos)} videos exported", "SUCCESS")
+                                        set_status('success', f"EXPORT SUCCESS: {len(videos)} videos exported to raw_links")
                                     else:
-                                        collector.add_log("EXPORT FAILED: No spreadsheet URL returned", "ERROR")
-                                        set_status('error', "EXPORT FAILED: No spreadsheet URL returned")
+                                        collector.add_log("EXPORT FAILED: No URL returned", "ERROR")
+                                        set_status('error', "EXPORT FAILED: Could not get spreadsheet URL")
                                         
                                 except Exception as e:
                                     error_msg = str(e)
                                     collector.add_log(f"EXPORT ERROR: {error_msg}", "ERROR")
                                     set_status('error', f"EXPORT FAILED: {error_msg}")
-                                    
-                                    # Additional error details
-                                    if "authentication" in error_msg.lower():
-                                        collector.add_log("Check Google Sheets service account credentials", "ERROR")
-                                    elif "permission" in error_msg.lower():
-                                        collector.add_log("Check if service account has write access to spreadsheet", "ERROR")
-                                    elif "spreadsheet" in error_msg.lower():
-                                        collector.add_log("Check if spreadsheet ID is correct and accessible", "ERROR")
-                            elif videos is None:
-                                collector.add_log("Cannot export: videos is None", "ERROR")
-                                set_status('error', "EXPORT FAILED: Collection returned None")
-                            elif not videos:
-                                collector.add_log("No videos collected - nothing to export", "INFO")
-                            else:
-                                if not auto_export:
-                                    collector.add_log("Auto-export disabled - videos collected but not exported", "INFO")
-                                elif not sheets_creds:
-                                    collector.add_log("No Google Sheets credentials - cannot export", "WARNING")
                     
                     except Exception as e:
-                        collector.add_log(f"CRITICAL ERROR in collection process: {str(e)}", "ERROR")
                         set_status('error', f"COLLECTION FAILED: {str(e)}")
-                        videos = []  # Ensure videos is never None
                     finally:
                         st.session_state.is_collecting = False
-                        # Debug logging
-                        if 'videos' in locals():
-                            collector.add_log(f"Final videos variable type: {type(videos)}, value: {videos}", "INFO")
-                        else:
-                            collector.add_log("Videos variable not defined at end of collection", "ERROR")
-                        st.rerun()
+                
+                st.rerun()
         
-        # Auto mode monitoring - non-blocking with error handling
+        # Auto mode monitoring - simplified and non-blocking
         if (st.session_state.auto_mode_running and 
             not st.session_state.is_collecting and 
-            st.session_state.auto_mode_enabled):
+            st.session_state.auto_mode_enabled and
+            youtube_api_key and sheets_creds and spreadsheet_id):
             
-            # Only check if we have required components
-            if youtube_api_key and sheets_creds and spreadsheet_id:
-                try:
-                    exporter = GoogleSheetsExporter(sheets_creds)
-                    collector = YouTubeCollector(youtube_api_key, sheets_exporter=exporter)
-                    
-                    # Safe, non-blocking auto mode check
-                    continue_auto = collector.check_auto_mode_safe(youtube_api_key, exporter, spreadsheet_id)
-                    
-                    if not continue_auto:
-                        # Auto mode was stopped due to errors
-                        st.rerun()
-                        
-                except Exception as e:
-                    # Critical error - stop auto mode immediately
-                    set_status('error', f"AUTO MODE CRITICAL ERROR: {str(e)}")
+            try:
+                exporter = GoogleSheetsExporter(sheets_creds)
+                collector = YouTubeCollector(youtube_api_key, sheets_exporter=exporter)
+                
+                # Run auto collection check
+                continue_auto = collector.run_auto_collection(youtube_api_key, exporter, spreadsheet_id)
+                
+                if not continue_auto:
                     st.session_state.auto_mode_running = False
-                    st.session_state.auto_mode_error_count = 0
                     st.rerun()
-            else:
-                # Missing requirements - stop auto mode
-                set_status('error', "AUTO MODE STOPPED: Missing API key, credentials, or spreadsheet ID")
+                    
+            except Exception as e:
+                set_status('error', f"AUTO MODE ERROR: {str(e)}")
                 st.session_state.auto_mode_running = False
+                st.rerun()
         
         with col2:
             if st.button("Stop", disabled=not st.session_state.is_collecting):
@@ -1736,6 +1637,7 @@ def main():
             if st.button("Reset"):
                 st.session_state.collected_videos = []
                 st.session_state.collector_stats = {'checked': 0, 'found': 0, 'rejected': 0, 'api_calls': 0, 'has_captions': 0, 'no_captions': 0}
+                clear_status()
                 st.rerun()
         
         with col4:
@@ -1752,6 +1654,8 @@ def main():
                         if sheet_url:
                             st.success("Exported to Google Sheets!")
                             st.markdown(f"[Open Spreadsheet]({sheet_url})")
+                        else:
+                            st.error("Export failed - no URL returned")
                     except Exception as e:
                         st.error(f"Export failed: {str(e)}")
         
@@ -1762,7 +1666,7 @@ def main():
             
             st.dataframe(
                 df[['title', 'category', 'view_count', 'duration_seconds', 'url']],
-                width='stretch',
+                use_container_width=True,
                 hide_index=True
             )
     
@@ -1850,7 +1754,7 @@ def main():
                     while st.session_state.is_rating:
                         # Check if target reached in target mode
                         if st.session_state.target_mode_enabled and st.session_state.target_progress >= st.session_state.target_videos:
-                            set_status('info', f"TARGET REACHED: {st.session_state.target_progress} videos successfully moved to tobe_links")
+                            set_status('success', f"TARGET REACHED: {st.session_state.target_progress} videos successfully moved to tobe_links")
                             st.session_state.is_rating = False
                             st.rerun()
                             break
@@ -1873,7 +1777,7 @@ def main():
                         if not next_video:
                             if st.session_state.target_mode_enabled:
                                 if st.session_state.target_progress >= st.session_state.target_videos:
-                                    set_status('info', f"TARGET REACHED: {st.session_state.target_progress} videos moved to tobe_links")
+                                    set_status('success', f"TARGET REACHED: {st.session_state.target_progress} videos moved to tobe_links")
                                 else:
                                     set_status('warning', f"TARGET NOT REACHED: {st.session_state.target_progress}/{st.session_state.target_videos} - No more videos available")
                             else:
