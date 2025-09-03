@@ -199,7 +199,7 @@ class GoogleSheetsExporter:
     def get_next_raw_video(self, spreadsheet_id: str) -> Optional[Dict]:
         """Get next video from raw_links sheet with rate limiting"""
         try:
-            self.rate_limiter.wait_if_needed()
+            self.rate_limiter.wait_if_needed(show_status=True)
             spreadsheet = self.get_spreadsheet_by_id(spreadsheet_id)
             
             self.rate_limiter.wait_if_needed()
@@ -219,6 +219,10 @@ class GoogleSheetsExporter:
             return None
         except Exception as e:
             st.error(f"Error fetching next video: {str(e)}")
+            if "quota" in str(e).lower() or "rate" in str(e).lower():
+                st.warning("Rate limit hit - increasing delays...")
+                # Increase the minimum delay if we hit rate limits
+                self.rate_limiter.min_delay = min(self.rate_limiter.min_delay * 1.5, 5.0)
             return None
     
     def delete_raw_video(self, spreadsheet_id: str, row_number: int):
