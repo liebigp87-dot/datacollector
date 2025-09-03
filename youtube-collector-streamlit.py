@@ -1,6 +1,7 @@
 """
 Combined YouTube Data Collector & Video Rating Tool
 Collects YouTube videos and rates them for content suitability
+WITH GOOGLE SHEETS API RATE LIMITING
 """
 
 import streamlit as st
@@ -130,8 +131,51 @@ CATEGORIES = {
     }
 }
 
+class GoogleSheetsRateLimiter:
+    """Rate limiter for Google Sheets API calls"""
+    
+    def __init__(self, min_delay=1.0, max_requests_per_100s=90):
+        """
+        Initialize rate limiter
+        
+        Args:
+            min_delay: Minimum delay between API calls in seconds
+            max_requests_per_100s: Maximum requests per 100 seconds (Google's limit is 100)
+        """
+        self.min_delay = min_delay
+        self.max_requests_per_100s = max_requests_per_100s
+        self.last_request_time = 0
+        self.request_times = []
+        
+    def wait_if_needed(self):
+        """Wait if necessary to avoid rate limits"""
+        current_time = time.time()
+        
+        # Enforce minimum delay between requests
+        time_since_last = current_time - self.last_request_time
+        if time_since_last < self.min_delay:
+            sleep_time = self.min_delay - time_since_last
+            time.sleep(sleep_time)
+            current_time = time.time()
+        
+        # Clean up old request times (older than 100 seconds)
+        self.request_times = [t for t in self.request_times if current_time - t < 100]
+        
+        # Check if we're approaching the rate limit
+        if len(self.request_times) >= self.max_requests_per_100s:
+            # Calculate how long to wait
+            oldest_request = self.request_times[0]
+            wait_time = 100 - (current_time - oldest_request) + 0.5  # Add 0.5s buffer
+            if wait_time > 0:
+                time.sleep(wait_time)
+                current_time = time.time()
+        
+        # Record this request
+        self.last_request_time = current_time
+        self.request_times.append(current_time)
+
 class GoogleSheetsExporter:
-    """Handle Google Sheets export and import"""
+    """Handle Google Sheets export and import with rate limiting"""
     
     def __init__(self, credentials_dict: Dict):
         """Initialize with service account credentials"""
@@ -141,9 +185,11 @@ class GoogleSheetsExporter:
                    'https://www.googleapis.com/auth/drive']
         )
         self.client = gspread.authorize(self.creds)
+        self.rate_limiter = GoogleSheetsRateLimiter(min_delay=1.2)  # 1.2 second minimum between calls
     
     def get_spreadsheet_by_id(self, spreadsheet_id: str):
-        """Get spreadsheet by ID"""
+        """Get spreadsheet by ID with rate limiting"""
+        self.rate_limiter.wait_if_needed()
         try:
             spreadsheet = self.client.open_by_key(spreadsheet_id)
             return spreadsheet
@@ -151,10 +197,15 @@ class GoogleSheetsExporter:
             raise e
     
     def get_next_raw_video(self, spreadsheet_id: str) -> Optional[Dict]:
-        """Get next video from raw_links sheet"""
+        """Get next video from raw_links sheet with rate limiting"""
         try:
+            self.rate_limiter.wait_if_needed()
             spreadsheet = self.get_spreadsheet_by_id(spreadsheet_id)
+            
+            self.rate_limiter.wait_if_needed()
             worksheet = spreadsheet.worksheet("raw_links")
+            
+            self.rate_limiter.wait_if_needed()
             all_values = worksheet.get_all_values()
             
             if len(all_values) > 1:
@@ -171,22 +222,30 @@ class GoogleSheetsExporter:
             return None
     
     def delete_raw_video(self, spreadsheet_id: str, row_number: int):
-        """Delete video from raw_links sheet"""
+        """Delete video from raw_links sheet with rate limiting"""
         try:
+            self.rate_limiter.wait_if_needed()
             spreadsheet = self.get_spreadsheet_by_id(spreadsheet_id)
+            
+            self.rate_limiter.wait_if_needed()
             worksheet = spreadsheet.worksheet("raw_links")
+            
+            self.rate_limiter.wait_if_needed()
             worksheet.delete_rows(row_number)
         except Exception as e:
             st.error(f"Error deleting video: {str(e)}")
     
     def add_to_tobe_links(self, spreadsheet_id: str, video_data: Dict, analysis_data: Dict):
-        """Add video to tobe_links sheet with analysis data"""
+        """Add video to tobe_links sheet with analysis data and rate limiting"""
         try:
+            self.rate_limiter.wait_if_needed()
             spreadsheet = self.get_spreadsheet_by_id(spreadsheet_id)
             
             try:
+                self.rate_limiter.wait_if_needed()
                 worksheet = spreadsheet.worksheet("tobe_links")
             except gspread.exceptions.WorksheetNotFound:
+                self.rate_limiter.wait_if_needed()
                 worksheet = spreadsheet.add_worksheet(title="tobe_links", rows=1000, cols=25)
                 
                 # Create headers combining raw_links + analysis data
@@ -197,6 +256,7 @@ class GoogleSheetsExporter:
                     'score', 'confidence', 'timestamped_moments', 'category_validation',
                     'analysis_timestamp'
                 ]
+                self.rate_limiter.wait_if_needed()
                 worksheet.append_row(headers)
             
             # Prepare row data
@@ -221,32 +281,41 @@ class GoogleSheetsExporter:
                 datetime.now().isoformat()
             ]
             
+            self.rate_limiter.wait_if_needed()
             worksheet.append_row(row_data)
         except Exception as e:
             st.error(f"Error adding to tobe_links: {str(e)}")
     
     def add_to_discarded(self, spreadsheet_id: str, video_url: str):
-        """Add video URL to discarded table"""
+        """Add video URL to discarded table with rate limiting"""
         try:
+            self.rate_limiter.wait_if_needed()
             spreadsheet = self.get_spreadsheet_by_id(spreadsheet_id)
             
             try:
+                self.rate_limiter.wait_if_needed()
                 worksheet = spreadsheet.worksheet("discarded")
             except gspread.exceptions.WorksheetNotFound:
+                self.rate_limiter.wait_if_needed()
                 worksheet = spreadsheet.add_worksheet(title="discarded", rows=1000, cols=1)
+                self.rate_limiter.wait_if_needed()
                 worksheet.append_row(['url'])  # Header
             
             # Add just the URL
+            self.rate_limiter.wait_if_needed()
             worksheet.append_row([video_url])
         except Exception as e:
             st.error(f"Error adding to discarded: {str(e)}")
     
     def load_discarded_urls(self, spreadsheet_id: str) -> set:
-        """Load existing URLs from discarded sheet"""
+        """Load existing URLs from discarded sheet with rate limiting"""
         try:
+            self.rate_limiter.wait_if_needed()
             spreadsheet = self.get_spreadsheet_by_id(spreadsheet_id)
             try:
+                self.rate_limiter.wait_if_needed()
                 worksheet = spreadsheet.worksheet("discarded")
+                self.rate_limiter.wait_if_needed()
                 all_values = worksheet.get_all_values()
                 
                 if len(all_values) > 1:
@@ -262,13 +331,16 @@ class GoogleSheetsExporter:
             return set()
     
     def add_time_comments(self, spreadsheet_id: str, video_id: str, video_url: str, comments_analysis: Dict):
-        """Add timestamped and category-matched comments to time_comments table"""
+        """Add timestamped and category-matched comments to time_comments table with rate limiting"""
         try:
+            self.rate_limiter.wait_if_needed()
             spreadsheet = self.get_spreadsheet_by_id(spreadsheet_id)
             
             try:
+                self.rate_limiter.wait_if_needed()
                 worksheet = spreadsheet.worksheet("time_comments")
             except gspread.exceptions.WorksheetNotFound:
+                self.rate_limiter.wait_if_needed()
                 worksheet = spreadsheet.add_worksheet(title="time_comments", rows=1000, cols=10)
                 
                 # Create headers
@@ -276,11 +348,14 @@ class GoogleSheetsExporter:
                     'video_id', 'video_url', 'comment_text', 'timestamp', 
                     'category_matched', 'relevance_score', 'sentiment'
                 ]
+                self.rate_limiter.wait_if_needed()
                 worksheet.append_row(headers)
             
             # Get timestamped moments from analysis
             moments = comments_analysis.get('timestamped_moments', [])
             
+            # Batch the moments to reduce API calls
+            rows_to_add = []
             for moment in moments:
                 row_data = [
                     video_id,
@@ -291,43 +366,59 @@ class GoogleSheetsExporter:
                     moment.get('relevance_score', 0),
                     moment.get('sentiment', '')
                 ]
-                worksheet.append_row(row_data)
+                rows_to_add.append(row_data)
+            
+            # Add all rows at once if possible (batch operation)
+            if rows_to_add:
+                for row in rows_to_add:
+                    self.rate_limiter.wait_if_needed()
+                    worksheet.append_row(row)
                 
         except Exception as e:
             st.error(f"Error adding to time_comments: {str(e)}")
     
     def export_to_sheets(self, videos: List[Dict], spreadsheet_id: str = None, spreadsheet_name: str = "YouTube_Collection_Data"):
-        """Export videos to raw_links sheet"""
+        """Export videos to raw_links sheet with rate limiting"""
         try:
             if spreadsheet_id:
+                self.rate_limiter.wait_if_needed()
                 spreadsheet = self.get_spreadsheet_by_id(spreadsheet_id)
             else:
                 try:
+                    self.rate_limiter.wait_if_needed()
                     spreadsheet = self.client.open(spreadsheet_name)
                 except gspread.exceptions.SpreadsheetNotFound:
+                    self.rate_limiter.wait_if_needed()
                     spreadsheet = self.client.create(spreadsheet_name)
             
             worksheet_name = "raw_links"
             
             try:
+                self.rate_limiter.wait_if_needed()
                 worksheet = spreadsheet.worksheet(worksheet_name)
             except gspread.exceptions.WorksheetNotFound:
+                self.rate_limiter.wait_if_needed()
                 worksheet = spreadsheet.add_worksheet(title=worksheet_name, rows=1000, cols=20)
             
             if videos:
                 df = pd.DataFrame(videos)
+                self.rate_limiter.wait_if_needed()
                 existing_data = worksheet.get_all_values()
                 
                 if existing_data and len(existing_data) > 1:
                     for _, row in df.iterrows():
                         values = [str(v) if pd.notna(v) else '' for v in row.tolist()]
+                        self.rate_limiter.wait_if_needed()
                         worksheet.append_row(values)
                 else:
+                    self.rate_limiter.wait_if_needed()
                     worksheet.clear()
                     headers = list(df.columns)
+                    self.rate_limiter.wait_if_needed()
                     worksheet.append_row(headers)
                     for _, row in df.iterrows():
                         values = [str(v) if pd.notna(v) else '' for v in row.tolist()]
+                        self.rate_limiter.wait_if_needed()
                         worksheet.append_row(values)
                 
                 return spreadsheet.url
@@ -1229,466 +1320,4 @@ class VideoRater:
         confidence = 0.3
         if len(video_data['comments']) > 100:
             confidence += 0.3
-        if len(video_data['comments']) > 500:
-            confidence += 0.2
-        if comments_analysis['category_validation'] > 0.6:
-            confidence += 0.2
-        
-        return {
-            'final_score': min(final_score, 10.0),
-            'confidence': min(confidence, 1.0),
-            'component_scores': component_scores,
-            'comments_analysis': comments_analysis
-        }
-
-
-def main():
-    st.markdown("""
-    <div class="main-header">
-        <h1>YouTube Collection & Rating Tool</h1>
-        <p><strong>Collect YouTube videos and rate them with AI analysis</strong></p>
-    </div>
-    """, unsafe_allow_html=True)
-    
-    # Sidebar configuration
-    with st.sidebar:
-        st.header("Configuration")
-        
-        # Mode selection
-        mode = st.radio(
-            "Select Mode:",
-            ["Data Collector", "Video Rater"],
-            horizontal=True
-        )
-        
-        st.subheader("API Configuration")
-        youtube_api_key = st.text_input(
-            "YouTube API Key", 
-            type="password", 
-            help="Your YouTube Data API v3 key"
-        )
-        
-        st.subheader("Google Sheets Configuration")
-        creds_input_method = st.radio(
-            "Service Account JSON:",
-            ["Paste JSON", "Upload JSON file"]
-        )
-        
-        sheets_creds = None
-        if creds_input_method == "Paste JSON":
-            sheets_creds_text = st.text_area(
-                "Service Account JSON", 
-                help="Paste your complete Google service account JSON",
-                height=150
-            )
-            if sheets_creds_text:
-                try:
-                    sheets_creds = json.loads(sheets_creds_text)
-                    st.success("Valid JSON")
-                except json.JSONDecodeError as e:
-                    st.error(f"Invalid JSON: {str(e)}")
-        else:
-            uploaded_file = st.file_uploader(
-                "Upload Service Account JSON",
-                type=['json']
-            )
-            if uploaded_file:
-                try:
-                    sheets_creds = json.load(uploaded_file)
-                    st.success("JSON file loaded")
-                except Exception as e:
-                    st.error(f"Error reading file: {str(e)}")
-        
-        # Google Sheets URL/ID
-        spreadsheet_url = st.text_input(
-            "Google Sheet URL",
-            value="https://docs.google.com/spreadsheets/d/1PHvW-LykIpIbwKJbiGHi6NcX7hd4EsIWK3zwr4Dmvrk/",
-            help="URL or ID of your Google Sheets document"
-        )
-        
-        match = re.search(r'/d/([a-zA-Z0-9-_]+)', spreadsheet_url)
-        spreadsheet_id = match.group(1) if match else spreadsheet_url
-        
-        if spreadsheet_id:
-            st.success(f"Sheet ID: {spreadsheet_id[:20]}...")
-        
-        if sheets_creds and 'client_email' in sheets_creds:
-            st.info(f"Service Account: {sheets_creds['client_email'][:30]}...")
-    
-    # Main content based on selected mode
-    if mode == "Data Collector":
-        st.subheader("Data Collector")
-        
-        with st.sidebar:
-            st.subheader("Collection Settings")
-            category = st.selectbox(
-                "Content Category",
-                options=['heartwarming', 'funny', 'traumatic', 'mixed']
-            )
-            
-            target_count = st.number_input(
-                "Target Video Count",
-                min_value=1,
-                max_value=500,
-                value=10
-            )
-            
-            auto_export = st.checkbox(
-                "Auto-export to Google Sheets",
-                value=True
-            )
-            
-            skip_quota_check = st.checkbox(
-                "Skip quota check",
-                value=False
-            )
-            
-            require_captions = st.checkbox(
-                "Require captions",
-                value=True
-            )
-        
-        # Statistics display
-        col1, col2, col3 = st.columns(3)
-        
-        with col1:
-            st.metric("Videos Found", st.session_state.collector_stats['found'])
-        with col2:
-            st.metric("Videos Checked", st.session_state.collector_stats['checked'])
-        with col3:
-            st.metric("Videos Rejected", st.session_state.collector_stats['rejected'])
-        
-        # Control buttons
-        col1, col2, col3, col4 = st.columns(4)
-        
-        with col1:
-            if st.button("Start Collection", disabled=st.session_state.is_collecting, type="primary"):
-                if not youtube_api_key:
-                    st.error("Please enter your YouTube API key")
-                else:
-                    st.session_state.is_collecting = True
-                    st.session_state.collector_stats = {'checked': 0, 'found': 0, 'rejected': 0, 'api_calls': 0, 'has_captions': 0, 'no_captions': 0}
-                    
-                    try:
-                        exporter = None
-                        if sheets_creds:
-                            try:
-                                exporter = GoogleSheetsExporter(sheets_creds)
-                            except Exception as e:
-                                st.warning(f"Could not initialize sheets exporter: {str(e)}")
-                        
-                        collector = YouTubeCollector(youtube_api_key, sheets_exporter=exporter)
-                        
-                        quota_available = True
-                        if not skip_quota_check:
-                            quota_available, quota_message = collector.check_quota_available()
-                            if not quota_available:
-                                st.error(f"Cannot start collection: {quota_message}")
-                                st.session_state.is_collecting = False
-                            else:
-                                st.success(f"{quota_message}")
-                        
-                        if quota_available:
-                            progress_bar = st.progress(0)
-                            status_text = st.empty()
-                            
-                            def update_progress(current, total):
-                                progress = current / total
-                                progress_bar.progress(progress)
-                                status_text.text(f"Collecting: {current}/{total} videos")
-                            
-                            with st.spinner(f"Collecting {target_count} videos for {category}..."):
-                                videos = collector.collect_videos(
-                                    target_count=target_count,
-                                    category=category,
-                                    spreadsheet_id=spreadsheet_id,
-                                    require_captions=require_captions,
-                                    progress_callback=update_progress
-                                )
-                            
-                            st.success(f"Collection complete! Found {len(videos)} videos.")
-                            
-                            if auto_export and sheets_creds and videos:
-                                try:
-                                    collector.add_log(f"Starting auto-export of {len(videos)} videos to Google Sheets", "INFO")
-                                    if not exporter:
-                                        exporter = GoogleSheetsExporter(sheets_creds)
-                                        collector.add_log("Initialized Google Sheets exporter", "INFO")
-                                    
-                                    collector.add_log(f"Attempting to export to spreadsheet ID: {spreadsheet_id}", "INFO")
-                                    sheet_url = exporter.export_to_sheets(videos, spreadsheet_id=spreadsheet_id)
-                                    
-                                    if sheet_url:
-                                        st.success("Exported to Google Sheets!")
-                                        st.markdown(f"[Open Spreadsheet]({sheet_url})")
-                                        collector.add_log(f"✅ EXPORT SUCCESS: {len(videos)} videos exported to raw_links sheet", "SUCCESS")
-                                        collector.add_log(f"Spreadsheet URL: {sheet_url}", "INFO")
-                                    else:
-                                        collector.add_log("❌ EXPORT FAILED: No spreadsheet URL returned", "ERROR")
-                                        st.error("Export completed but no URL returned")
-                                        
-                                except Exception as e:
-                                    error_msg = str(e)
-                                    collector.add_log(f"❌ EXPORT ERROR: {error_msg}", "ERROR")
-                                    st.error(f"Export failed: {error_msg}")
-                                    
-                                    # Additional error details
-                                    if "authentication" in error_msg.lower():
-                                        collector.add_log("Check Google Sheets service account credentials", "ERROR")
-                                    elif "permission" in error_msg.lower():
-                                        collector.add_log("Check if service account has write access to spreadsheet", "ERROR")
-                                    elif "spreadsheet" in error_msg.lower():
-                                        collector.add_log("Check if spreadsheet ID is correct and accessible", "ERROR")
-                            else:
-                                if not auto_export:
-                                    collector.add_log("Auto-export disabled - videos collected but not exported", "INFO")
-                                elif not sheets_creds:
-                                    collector.add_log("No Google Sheets credentials - cannot export", "WARNING")
-                                elif not videos:
-                                    collector.add_log("No videos collected - nothing to export", "INFO")
-                    
-                    except Exception as e:
-                        st.error(f"Collection error: {str(e)}")
-                    finally:
-                        st.session_state.is_collecting = False
-                        st.rerun()
-        
-        with col2:
-            if st.button("Stop", disabled=not st.session_state.is_collecting):
-                st.session_state.is_collecting = False
-                st.rerun()
-        
-        with col3:
-            if st.button("Reset"):
-                st.session_state.collected_videos = []
-                st.session_state.collector_stats = {'checked': 0, 'found': 0, 'rejected': 0, 'api_calls': 0, 'has_captions': 0, 'no_captions': 0}
-                st.rerun()
-        
-        with col4:
-            if st.button("Manual Export") and st.session_state.collected_videos:
-                if not sheets_creds:
-                    st.error("Please add Google Sheets credentials")
-                else:
-                    try:
-                        exporter = GoogleSheetsExporter(sheets_creds)
-                        sheet_url = exporter.export_to_sheets(
-                            st.session_state.collected_videos, 
-                            spreadsheet_id=spreadsheet_id
-                        )
-                        if sheet_url:
-                            st.success("Exported to Google Sheets!")
-                            st.markdown(f"[Open Spreadsheet]({sheet_url})")
-                    except Exception as e:
-                        st.error(f"Export failed: {str(e)}")
-        
-        # Display collected videos
-        if st.session_state.collected_videos:
-            st.subheader("Collected Videos")
-            df = pd.DataFrame(st.session_state.collected_videos)
-            
-            st.dataframe(
-                df[['title', 'category', 'view_count', 'duration_seconds', 'url']],
-                use_container_width=True,
-                hide_index=True
-            )
-    
-    elif mode == "Video Rater":
-        st.subheader("Video Rater")
-        
-        # Statistics display
-        col1, col2, col3 = st.columns(3)
-        
-        with col1:
-            st.metric("Videos Rated", st.session_state.rater_stats['rated'])
-        with col2:
-            st.metric("Moved to tobe_links", st.session_state.rater_stats['moved_to_tobe'])
-        with col3:
-            st.metric("API Calls", st.session_state.rater_stats['api_calls'])
-        
-        if not youtube_api_key or not sheets_creds or not spreadsheet_id:
-            st.warning("Please configure YouTube API key, Google Sheets credentials, and spreadsheet URL in the sidebar.")
-        else:
-            # Rating control
-            col1, col2 = st.columns([1, 1])
-            
-            with col1:
-                if st.button("Start Rating", disabled=st.session_state.is_rating, type="primary"):
-                    st.session_state.is_rating = True
-                    st.rerun()
-            
-            with col2:
-                if st.button("Stop Rating", disabled=not st.session_state.is_rating):
-                    st.session_state.is_rating = False
-                    st.rerun()
-            
-            if st.session_state.is_rating:
-                try:
-                    rater = VideoRater(youtube_api_key)
-                    exporter = GoogleSheetsExporter(sheets_creds)
-                    
-                    # Continuous rating loop
-                    while st.session_state.is_rating:
-                        # Check quota before each video
-                        quota_available, quota_message = rater.check_quota_available()
-                        
-                        if not quota_available:
-                            st.error(f"Stopping rating: {quota_message}")
-                            st.session_state.is_rating = False
-                            break
-                        
-                        # Get next video from raw_links
-                        next_video = exporter.get_next_raw_video(spreadsheet_id)
-                        
-                        if not next_video:
-                            st.success("All videos have been processed! No more videos in raw_links.")
-                            st.session_state.is_rating = False
-                            break
-                        
-                        # Display video info and use category from raw_links
-                        video_category = next_video.get('category', 'heartwarming')
-                        
-                        # Create a container for the current video being processed
-                        video_container = st.container()
-                        
-                        with video_container:
-                            st.markdown(f"### Currently Processing:")
-                            st.markdown(f"**Title:** {next_video.get('title', 'Unknown Title')}")
-                            st.markdown(f"**Channel:** {next_video.get('channel_title', 'Unknown')}")
-                            st.markdown(f"**Category:** {video_category} {CATEGORIES.get(video_category, {}).get('emoji', '')}")
-                            
-                            col1, col2, col3 = st.columns(3)
-                            with col1:
-                                st.metric("Views", f"{int(next_video.get('view_count', 0)):,}")
-                            with col2:
-                                st.metric("Likes", f"{int(next_video.get('like_count', 0)):,}")
-                            with col3:
-                                st.metric("Comments", f"{int(next_video.get('comment_count', 0)):,}")
-                        
-                        # Analyze video using category from raw_links
-                        with st.spinner("Analyzing video..."):
-                            video_id = next_video.get('video_id')
-                            if video_id:
-                                try:
-                                    video_data = rater.fetch_video_data(video_id)
-                                    analysis = rater.calculate_category_score(video_data, video_category)
-                                    
-                                    # Display score
-                                    score = analysis['final_score']
-                                    confidence = analysis['confidence']
-                                    
-                                    col1, col2 = st.columns([2, 1])
-                                    
-                                    with col2:
-                                        st.markdown(f"""
-                                        <div class="score-card">
-                                            <h2>Score</h2>
-                                            <h1 style="font-size: 3rem;">{score:.1f}/10</h1>
-                                            <p>Confidence: {confidence:.0%}</p>
-                                        </div>
-                                        """, unsafe_allow_html=True)
-                                    
-                                    with col1:
-                                        # Display timestamped moments
-                                        moments = analysis['comments_analysis'].get('timestamped_moments', [])
-                                        if moments:
-                                            st.subheader("Timestamped Moments")
-                                            for moment in moments[:5]:
-                                                st.markdown(f"""
-                                                <div class="timestamp-moment">
-                                                    <strong>{moment['timestamp']}</strong><br>
-                                                    <em>"{moment['comment'][:100]}{'...' if len(moment['comment']) > 100 else ''}"</em>
-                                                </div>
-                                                """, unsafe_allow_html=True)
-                                        else:
-                                            st.info("No timestamped moments found")
-                                    
-                                    # Process the video automatically
-                                    video_url = next_video.get('url', '')
-                                    
-                                    # Always add to discarded first (before deletion)
-                                    if video_url:
-                                        exporter.add_to_discarded(spreadsheet_id, video_url)
-                                    
-                                    # Then delete from raw_links
-                                    exporter.delete_raw_video(spreadsheet_id, next_video['row_number'])
-                                    
-                                    # If score >= 6.5, add to tobe_links AND time_comments
-                                    if score >= 6.5:
-                                        exporter.add_to_tobe_links(spreadsheet_id, next_video, analysis)
-                                        
-                                        # Also add time_comments for qualifying videos
-                                        exporter.add_time_comments(
-                                            spreadsheet_id, 
-                                            video_id, 
-                                            video_url, 
-                                            analysis['comments_analysis']
-                                        )
-                                        
-                                        st.session_state.rater_stats['moved_to_tobe'] += 1
-                                        st.success(f"✅ Score: {score:.1f}/10 - Moved to tobe_links!")
-                                        rater.add_log(f"Video {next_video.get('title', '')[:50]} scored {score:.1f} - moved to tobe_links and time_comments", "SUCCESS")
-                                    else:
-                                        st.info(f"ℹ️ Score: {score:.1f}/10 - Below threshold, removed from raw_links.")
-                                        rater.add_log(f"Video {next_video.get('title', '')[:50]} scored {score:.1f} - removed", "INFO")
-                                    
-                                    # Log the discarded action
-                                    rater.add_log(f"Added URL to discarded: {video_url}", "INFO")
-                                    
-                                    st.session_state.rater_stats['rated'] += 1
-                                    
-                                    # Brief pause before next video
-                                    time.sleep(2)
-                                    
-                                    # Clear the container for next video
-                                    video_container.empty()
-                                
-                                except Exception as e:
-                                    st.error(f"Error analyzing video: {str(e)}")
-                                    rater.add_log(f"Error analyzing video: {str(e)}", "ERROR")
-                                    
-                                    # Still add to discarded and delete to avoid infinite loop
-                                    video_url = next_video.get('url', '')
-                                    if video_url:
-                                        exporter.add_to_discarded(spreadsheet_id, video_url)
-                                        rater.add_log(f"Added failed video URL to discarded: {video_url}", "INFO")
-                                    
-                                    exporter.delete_raw_video(spreadsheet_id, next_video['row_number'])
-                                    time.sleep(1)
-                            else:
-                                st.error("No video ID found")
-                                
-                                # Still add to discarded and delete to avoid reprocessing
-                                video_url = next_video.get('url', '')
-                                if video_url:
-                                    exporter.add_to_discarded(spreadsheet_id, video_url)
-                                    rater.add_log(f"Added video with missing ID to discarded: {video_url}", "INFO")
-                                
-                                exporter.delete_raw_video(spreadsheet_id, next_video['row_number'])
-                        
-                        # Small delay and rerun to continue the loop
-                        if st.session_state.is_rating:  # Check if still rating
-                            time.sleep(0.5)
-                            st.rerun()
-                
-                except Exception as e:
-                    st.error(f"Rating error: {str(e)}")
-                    st.session_state.is_rating = False
-    
-    # Activity log
-    with st.expander("Activity Log", expanded=False):
-        if st.session_state.logs:
-            for log in st.session_state.logs[-20:]:  # Show last 20 entries
-                if "SUCCESS" in log:
-                    st.success(log)
-                elif "ERROR" in log:
-                    st.error(log)
-                elif "WARNING" in log:
-                    st.warning(log)
-                else:
-                    st.info(log)
-        else:
-            st.info("No activity yet")
-
-
-if __name__ == "__main__":
-    main()
+        if len(video_data['
