@@ -1,7 +1,6 @@
 """
-Combined YouTube Data Collector & Video Rating Tool
-Collects YouTube videos and rates them for content suitability
-WITH GOOGLE SHEETS API RATE LIMITING
+Optimized YouTube Data Collector & Video Rating Tool
+With pre-filtered search, pagination, and reduced redundancy
 """
 
 import streamlit as st
@@ -103,7 +102,7 @@ if 'is_collecting' not in st.session_state:
 if 'is_rating' not in st.session_state:
     st.session_state.is_rating = False
 if 'collector_stats' not in st.session_state:
-    st.session_state.collector_stats = {'checked': 0, 'found': 0, 'rejected': 0, 'api_calls': 0, 'has_captions': 0, 'no_captions': 0}
+    st.session_state.collector_stats = {'checked': 0, 'found': 0, 'rejected': 0, 'search_calls': 0, 'detail_calls': 0, 'has_captions': 0, 'no_captions': 0}
 if 'rater_stats' not in st.session_state:
     st.session_state.rater_stats = {'rated': 0, 'moved_to_tobe': 0, 'rejected': 0, 'api_calls': 0}
 if 'logs' not in st.session_state:
@@ -112,6 +111,49 @@ if 'used_queries' not in st.session_state:
     st.session_state.used_queries = set()
 if 'analysis_history' not in st.session_state:
     st.session_state.analysis_history = []
+
+# YouTube video categories (stable list)
+YOUTUBE_CATEGORIES = {
+    "0": "All Categories",
+    "1": "Film & Animation",
+    "2": "Autos & Vehicles",
+    "10": "Music",
+    "15": "Pets & Animals",
+    "17": "Sports",
+    "19": "Travel & Events",
+    "20": "Gaming",
+    "22": "People & Blogs",
+    "23": "Comedy",
+    "24": "Entertainment",
+    "25": "News & Politics",
+    "26": "Howto & Style",
+    "27": "Education",
+    "28": "Science & Technology",
+}
+
+REGION_CODES = {
+    "": "All Regions",
+    "US": "United States",
+    "GB": "United Kingdom",
+    "CA": "Canada",
+    "AU": "Australia",
+    "DE": "Germany",
+    "FR": "France",
+    "JP": "Japan",
+    "KR": "South Korea",
+    "BR": "Brazil",
+    "IN": "India",
+    "MX": "Mexico",
+    "ES": "Spain",
+    "IT": "Italy",
+    "NL": "Netherlands",
+    "PL": "Poland",
+    "RU": "Russia",
+    "SE": "Sweden",
+    "TR": "Turkey",
+    "AR": "Argentina",
+    "ZA": "South Africa"
+}
 
 CATEGORIES = {
     'heartwarming': {
@@ -132,60 +174,74 @@ CATEGORIES = {
 }
 
 class GoogleSheetsRateLimiter:
-    """Rate limiter for Google Sheets API calls"""
+    """Session-state based rate limiter for Google Sheets API calls"""
     
-    def __init__(self, min_delay=1.0, max_requests_per_100s=90):
-        """
-        Initialize rate limiter
-        
-        Args:
-            min_delay: Minimum delay between API calls in seconds
-            max_requests_per_100s: Maximum requests per 100 seconds (Google's limit is 100)
-        """
+    def __init__(self, min_delay=1.5, max_requests_per_100s=80):
         self.min_delay = min_delay
         self.max_requests_per_100s = max_requests_per_100s
-        self.last_request_time = 0
-        self.request_times = []
         
-    def wait_if_needed(self):
-        """Wait if necessary to avoid rate limits"""
+        if 'sheets_api_timestamps' not in st.session_state:
+            st.session_state.sheets_api_timestamps = []
+        if 'sheets_last_request' not in st.session_state:
+            st.session_state.sheets_last_request = 0
+        if 'sheets_api_call_count' not in st.session_state:
+            st.session_state.sheets_api_call_count = 0
+        
+    def wait_if_needed(self, show_status=False):
+        """Wait if necessary to avoid rate limits using session state"""
         current_time = time.time()
         
-        # Enforce minimum delay between requests
-        time_since_last = current_time - self.last_request_time
+        st.session_state.sheets_api_timestamps = [
+            t for t in st.session_state.sheets_api_timestamps 
+            if current_time - t < 100
+        ]
+        
+        delay_needed = 0
+        reason = ""
+        
+        time_since_last = current_time - st.session_state.sheets_last_request
         if time_since_last < self.min_delay:
-            sleep_time = self.min_delay - time_since_last
-            time.sleep(sleep_time)
+            delay_needed = self.min_delay - time_since_last
+            reason = "minimum spacing"
+        
+        if len(st.session_state.sheets_api_timestamps) >= self.max_requests_per_100s:
+            oldest_request = st.session_state.sheets_api_timestamps[0]
+            wait_for_window = 100 - (current_time - oldest_request) + 1
+            if wait_for_window > delay_needed:
+                delay_needed = wait_for_window
+                reason = f"rate limit ({len(st.session_state.sheets_api_timestamps)}/{self.max_requests_per_100s} requests in window)"
+        
+        if delay_needed > 0:
+            if show_status:
+                with st.spinner(f"Rate limiting: waiting {delay_needed:.1f}s ({reason})..."):
+                    time.sleep(delay_needed)
+            else:
+                time.sleep(delay_needed)
             current_time = time.time()
         
-        # Clean up old request times (older than 100 seconds)
-        self.request_times = [t for t in self.request_times if current_time - t < 100]
-        
-        # Check if we're approaching the rate limit
-        if len(self.request_times) >= self.max_requests_per_100s:
-            # Calculate how long to wait
-            oldest_request = self.request_times[0]
-            wait_time = 100 - (current_time - oldest_request) + 0.5  # Add 0.5s buffer
-            if wait_time > 0:
-                time.sleep(wait_time)
-                current_time = time.time()
-        
-        # Record this request
-        self.last_request_time = current_time
-        self.request_times.append(current_time)
+        st.session_state.sheets_last_request = current_time
+        st.session_state.sheets_api_timestamps.append(current_time)
+        st.session_state.sheets_api_call_count += 1
+
 
 class GoogleSheetsExporter:
-    """Handle Google Sheets export and import with rate limiting"""
+    """Handle Google Sheets export and import with session-state based rate limiting"""
     
     def __init__(self, credentials_dict: Dict):
-        """Initialize with service account credentials"""
         self.creds = Credentials.from_service_account_info(
             credentials_dict,
             scopes=['https://www.googleapis.com/auth/spreadsheets',
                    'https://www.googleapis.com/auth/drive']
         )
         self.client = gspread.authorize(self.creds)
-        self.rate_limiter = GoogleSheetsRateLimiter(min_delay=1.2)  # 1.2 second minimum between calls
+        self.rate_limiter = GoogleSheetsRateLimiter(min_delay=1.5)
+        
+        if 'sheets_api_stats' not in st.session_state:
+            st.session_state.sheets_api_stats = {
+                'total_calls': 0,
+                'last_call_time': 0,
+                'calls_in_last_100s': 0
+            }
     
     def get_spreadsheet_by_id(self, spreadsheet_id: str):
         """Get spreadsheet by ID with rate limiting"""
@@ -212,16 +268,14 @@ class GoogleSheetsExporter:
                 headers = all_values[0]
                 first_row = all_values[1]
                 
-                # Convert to dict
                 video_data = {headers[i]: first_row[i] for i in range(len(headers))}
-                video_data['row_number'] = 2  # Row 2 in Google Sheets (1-indexed)
+                video_data['row_number'] = 2
                 return video_data
             return None
         except Exception as e:
             st.error(f"Error fetching next video: {str(e)}")
             if "quota" in str(e).lower() or "rate" in str(e).lower():
                 st.warning("Rate limit hit - increasing delays...")
-                # Increase the minimum delay if we hit rate limits
                 self.rate_limiter.min_delay = min(self.rate_limiter.min_delay * 1.5, 5.0)
             return None
     
@@ -252,7 +306,6 @@ class GoogleSheetsExporter:
                 self.rate_limiter.wait_if_needed()
                 worksheet = spreadsheet.add_worksheet(title="tobe_links", rows=1000, cols=25)
                 
-                # Create headers combining raw_links + analysis data
                 headers = [
                     'video_id', 'title', 'url', 'category', 'search_query', 
                     'duration_seconds', 'view_count', 'like_count', 'comment_count',
@@ -263,7 +316,6 @@ class GoogleSheetsExporter:
                 self.rate_limiter.wait_if_needed()
                 worksheet.append_row(headers)
             
-            # Prepare row data
             row_data = [
                 video_data.get('video_id', ''),
                 video_data.get('title', ''),
@@ -303,9 +355,8 @@ class GoogleSheetsExporter:
                 self.rate_limiter.wait_if_needed()
                 worksheet = spreadsheet.add_worksheet(title="discarded", rows=1000, cols=1)
                 self.rate_limiter.wait_if_needed()
-                worksheet.append_row(['url'])  # Header
+                worksheet.append_row(['url'])
             
-            # Add just the URL
             self.rate_limiter.wait_if_needed()
             worksheet.append_row([video_url])
         except Exception as e:
@@ -323,11 +374,9 @@ class GoogleSheetsExporter:
                 all_values = worksheet.get_all_values()
                 
                 if len(all_values) > 1:
-                    # Skip header row, get URLs from first column
                     discarded_urls = {row[0] for row in all_values[1:] if row and row[0]}
                     return discarded_urls
             except gspread.exceptions.WorksheetNotFound:
-                # Sheet doesn't exist yet, return empty set
                 pass
             return set()
         except Exception as e:
@@ -347,7 +396,6 @@ class GoogleSheetsExporter:
                 self.rate_limiter.wait_if_needed()
                 worksheet = spreadsheet.add_worksheet(title="time_comments", rows=1000, cols=10)
                 
-                # Create headers
                 headers = [
                     'video_id', 'video_url', 'comment_text', 'timestamp', 
                     'category_matched', 'relevance_score', 'sentiment'
@@ -355,10 +403,8 @@ class GoogleSheetsExporter:
                 self.rate_limiter.wait_if_needed()
                 worksheet.append_row(headers)
             
-            # Get timestamped moments from analysis
             moments = comments_analysis.get('timestamped_moments', [])
             
-            # Batch the moments to reduce API calls
             rows_to_add = []
             for moment in moments:
                 row_data = [
@@ -372,7 +418,6 @@ class GoogleSheetsExporter:
                 ]
                 rows_to_add.append(row_data)
             
-            # Add all rows at once if possible (batch operation)
             if rows_to_add:
                 for row in rows_to_add:
                     self.rate_limiter.wait_if_needed()
@@ -431,10 +476,70 @@ class GoogleSheetsExporter:
         except Exception as e:
             st.error(f"Error exporting to sheets: {str(e)}")
             raise e
+    
+    def load_existing_sheet_ids(self, spreadsheet_id: str) -> set:
+        """Load existing video IDs from Google Sheet"""
+        try:
+            self.rate_limiter.wait_if_needed()
+            spreadsheet = self.get_spreadsheet_by_id(spreadsheet_id)
+            self.rate_limiter.wait_if_needed()
+            worksheet = spreadsheet.worksheet("raw_links")
+            self.rate_limiter.wait_if_needed()
+            all_values = worksheet.get_all_values()
+            
+            if len(all_values) > 1:
+                headers = all_values[0]
+                video_id_index = headers.index('video_id') if 'video_id' in headers else 0
+                existing_ids = {row[video_id_index] for row in all_values[1:] if len(row) > video_id_index and row[video_id_index]}
+                return existing_ids
+            return set()
+        except Exception as e:
+            return set()
+    
+    def load_used_queries(self, spreadsheet_id: str) -> set:
+        """Load previously used queries from Google Sheet"""
+        try:
+            self.rate_limiter.wait_if_needed()
+            spreadsheet = self.get_spreadsheet_by_id(spreadsheet_id)
+            try:
+                self.rate_limiter.wait_if_needed()
+                worksheet = spreadsheet.worksheet("used_queries")
+                self.rate_limiter.wait_if_needed()
+                all_values = worksheet.get_all_values()
+                
+                if len(all_values) > 1:
+                    used_queries = {row[0] for row in all_values[1:] if row and row[0]}
+                    return used_queries
+            except gspread.exceptions.WorksheetNotFound:
+                self.rate_limiter.wait_if_needed()
+                worksheet = spreadsheet.add_worksheet(title="used_queries", rows=1000, cols=5)
+                self.rate_limiter.wait_if_needed()
+                worksheet.append_row(['query', 'category', 'timestamp', 'videos_found', 'session_id'])
+            return set()
+        except Exception as e:
+            return set()
+    
+    def save_used_query(self, spreadsheet_id: str, query: str, category: str, videos_found: int):
+        """Save used query to Google Sheet"""
+        try:
+            self.rate_limiter.wait_if_needed()
+            spreadsheet = self.get_spreadsheet_by_id(spreadsheet_id)
+            self.rate_limiter.wait_if_needed()
+            worksheet = spreadsheet.worksheet("used_queries")
+            self.rate_limiter.wait_if_needed()
+            worksheet.append_row([
+                query,
+                category,
+                datetime.now().isoformat(),
+                videos_found,
+                st.session_state.get('session_id', 'manual')
+            ])
+        except Exception as e:
+            pass
 
 
 class YouTubeCollector:
-    """YouTube video collection functionality"""
+    """Optimized YouTube video collection with pre-filtering and pagination"""
     
     def __init__(self, api_key: str, sheets_exporter=None):
         self.youtube = build('youtube', 'v3', developerKey=api_key)
@@ -443,7 +548,6 @@ class YouTubeCollector:
         self.existing_queries = set()
         self.discarded_urls = set()
         
-        # Search queries for unified categories
         self.search_queries = {
             'heartwarming': [
                 'soldier surprise homecoming', 'dog reunion owner', 'random acts kindness',
@@ -482,24 +586,13 @@ class YouTubeCollector:
                 'bridge collapse footage', 'explosion caught camera', 'emergency landing footage'
             ]
         }
-        
-        self.music_keywords = [
-            'music video', 'official video', 'official music',
-            'lyrics', 'lyric video', 'audio', 'soundtrack',
-            'ost', 'mv', 'song', 'album', 'single release'
-        ]
-        
-        self.compilation_keywords = [
-            'best of', 'top 10', 'top 20',
-            'montage', 'every time', 'all moments', 'mega compilation'
-        ]
     
     def add_log(self, message: str, log_type: str = "INFO"):
         """Add a detailed log entry"""
         timestamp = datetime.now().strftime("%H:%M:%S")
         log_entry = f"[{timestamp}] COLLECTOR {log_type}: {message}"
         st.session_state.logs.insert(0, log_entry)
-        st.session_state.logs = st.session_state.logs[:100]  # Keep more logs for debugging
+        st.session_state.logs = st.session_state.logs[:100]
     
     def check_quota_available(self) -> Tuple[bool, str]:
         """Check if YouTube API quota is available"""
@@ -510,7 +603,7 @@ class YouTubeCollector:
                 id='YbJOTdZBX1g'
             )
             response = test_request.execute()
-            st.session_state.collector_stats['api_calls'] += 1
+            st.session_state.collector_stats['detail_calls'] += 1
             self.add_log("API quota check passed", "SUCCESS")
             return True, "Quota available"
         except HttpError as e:
@@ -528,33 +621,87 @@ class YouTubeCollector:
             self.add_log(f"Non-API error: {str(e)[:100]}", "WARNING")
             return True, "Could not verify quota, proceeding anyway"
     
-    def search_videos(self, query: str, max_results: int = 25) -> List[Dict]:
-        """Search for videos using YouTube API"""
+    def search_videos(self, query: str, max_results: int = 50, page_token: str = None, 
+                     region_code: str = None, category_id: str = None) -> Tuple[List[Dict], str]:
+        """
+        Search for videos with pre-filtering in the API query
+        Returns: (items, nextPageToken)
+        """
         try:
-            st.session_state.collector_stats['api_calls'] += 1
+            st.session_state.collector_stats['search_calls'] += 1
+            
+            # Apply time filter - videos from last 6 months
             six_months_ago = (datetime.now() - timedelta(days=180)).isoformat() + 'Z'
             
-            request = self.youtube.search().list(
-                part='id,snippet',
-                q=query,
-                type='video',
-                maxResults=max_results,
-                order='relevance',
-                publishedAfter=six_months_ago,
-                videoDuration='medium',
-                relevanceLanguage='en'
-            )
+            # Build the search query with exclusions
+            excluded_terms = [
+                '-shorts', '-#shorts', '-#short',
+                '-"music video"', '-"official video"', '-"lyric video"', 
+                '-"official audio"', '-compilation', '-"best of"',
+                '-"top 10"', '-"top 20"', '-montage'
+            ]
             
+            filtered_query = f'{query} {" ".join(excluded_terms)}'
+            
+            # Build request parameters
+            params = {
+                'part': 'id,snippet',
+                'q': filtered_query,
+                'type': 'video',
+                'maxResults': min(max_results, 50),  # API limit is 50 per page
+                'order': 'relevance',
+                'publishedAfter': six_months_ago,
+                'videoDuration': 'medium',  # 4-20 minutes (excludes shorts)
+                'videoEmbeddable': 'any',  # Changed from 'true' to get more results
+                'relevanceLanguage': 'en',
+                'safeSearch': 'none'
+            }
+            
+            # Add optional parameters
+            if page_token:
+                params['pageToken'] = page_token
+            if region_code and region_code != "":
+                params['regionCode'] = region_code
+            if category_id and category_id != "0":
+                params['videoCategoryId'] = category_id
+            
+            request = self.youtube.search().list(**params)
             response = request.execute()
-            return response.get('items', [])
+            
+            items = response.get('items', [])
+            next_page_token = response.get('nextPageToken', None)
+            
+            # Quick pre-filter based on snippet data (no extra API calls)
+            filtered_items = []
+            for item in items:
+                title = item['snippet']['title'].lower()
+                
+                # Quick checks that don't require additional API calls
+                skip = False
+                
+                unwanted = ['#shorts', 'compilation', 'top 10', 'top 20', 
+                           'every time', 'all moments', 'best of', 'music video',
+                           'official video', 'lyric', 'audio only']
+                
+                for word in unwanted:
+                    if word in title:
+                        skip = True
+                        break
+                
+                if not skip:
+                    filtered_items.append(item)
+            
+            self.add_log(f"Search returned {len(items)} items, {len(filtered_items)} after pre-filter", "INFO")
+            return filtered_items, next_page_token
+            
         except HttpError as e:
             self.add_log(f"API Error during search: {str(e)}", "ERROR")
-            return []
+            return [], None
     
     def get_video_details(self, video_id: str) -> Optional[Dict]:
         """Get detailed information about a video"""
         try:
-            st.session_state.collector_stats['api_calls'] += 1
+            st.session_state.collector_stats['detail_calls'] += 1
             request = self.youtube.videos().list(
                 part='snippet,contentDetails,statistics',
                 id=video_id
@@ -567,28 +714,6 @@ class YouTubeCollector:
         except HttpError as e:
             self.add_log(f"API Error getting video details: {str(e)}", "ERROR")
             return None
-    
-    def is_youtube_short(self, video_id: str, details: Dict) -> bool:
-        """Check if video is a YouTube Short"""
-        try:
-            title = details['snippet'].get('title', '').lower()
-            description = details['snippet'].get('description', '').lower()
-            
-            shorts_indicators = ['#shorts', '#short', '#youtubeshorts', '#ytshorts']
-            for indicator in shorts_indicators:
-                if indicator in title or indicator in description:
-                    return True
-            
-            duration = isodate.parse_duration(details['contentDetails']['duration'])
-            duration_seconds = duration.total_seconds()
-            
-            if duration_seconds <= 60:
-                return True
-            
-            return False
-        except Exception as e:
-            self.add_log(f"Error checking if video is Short: {str(e)}", "WARNING")
-            return False
     
     def check_caption_availability(self, details: Dict) -> bool:
         """Check if video has captions"""
@@ -611,210 +736,75 @@ class YouTubeCollector:
             self.add_log(f"Error checking captions: {str(e)}", "WARNING")
             return False
     
-    def load_existing_sheet_ids(self, spreadsheet_id: str) -> set:
-        """Load existing video IDs from Google Sheet"""
-        try:
-            if self.sheets_exporter:
-                spreadsheet = self.sheets_exporter.get_spreadsheet_by_id(spreadsheet_id)
-                worksheet = spreadsheet.worksheet("raw_links")
-                all_values = worksheet.get_all_values()
-                
-                if len(all_values) > 1:
-                    headers = all_values[0]
-                    video_id_index = headers.index('video_id') if 'video_id' in headers else 0
-                    existing_ids = {row[video_id_index] for row in all_values[1:] if row[video_id_index]}
-                    self.add_log(f"Loaded {len(existing_ids)} existing video IDs from raw_links", "INFO")
-                    return existing_ids
-            return set()
-        except Exception as e:
-            self.add_log(f"Could not load existing sheet IDs: {str(e)}", "WARNING")
-            return set()
-    
-    def load_discarded_urls(self, spreadsheet_id: str) -> set:
-        """Load discarded URLs to prevent reprocessing"""
-        try:
-            if self.sheets_exporter:
-                discarded_urls = self.sheets_exporter.load_discarded_urls(spreadsheet_id)
-                self.add_log(f"Loaded {len(discarded_urls)} discarded URLs for duplicate check", "INFO")
-                return discarded_urls
-            return set()
-        except Exception as e:
-            self.add_log(f"Could not load discarded URLs: {str(e)}", "WARNING")
-            return set()
-    
-    def load_used_queries(self, spreadsheet_id: str) -> set:
-        """Load previously used queries from Google Sheet"""
-        try:
-            if self.sheets_exporter:
-                spreadsheet = self.sheets_exporter.get_spreadsheet_by_id(spreadsheet_id)
-                try:
-                    worksheet = spreadsheet.worksheet("used_queries")
-                    all_values = worksheet.get_all_values()
-                    
-                    if len(all_values) > 1:
-                        used_queries = {row[0] for row in all_values[1:] if row[0]}
-                        self.add_log(f"Loaded {len(used_queries)} previously used queries", "INFO")
-                        return used_queries
-                except gspread.exceptions.WorksheetNotFound:
-                    worksheet = spreadsheet.add_worksheet(title="used_queries", rows=1000, cols=5)
-                    worksheet.append_row(['query', 'category', 'timestamp', 'videos_found', 'session_id'])
-                    self.add_log("Created new used_queries worksheet", "INFO")
-            return set()
-        except Exception as e:
-            self.add_log(f"Could not load used queries: {str(e)}", "WARNING")
-            return set()
-    
-    def save_used_query(self, spreadsheet_id: str, query: str, category: str, videos_found: int):
-        """Save used query to Google Sheet"""
-        try:
-            if self.sheets_exporter:
-                spreadsheet = self.sheets_exporter.get_spreadsheet_by_id(spreadsheet_id)
-                worksheet = spreadsheet.worksheet("used_queries")
-                worksheet.append_row([
-                    query,
-                    category,
-                    datetime.now().isoformat(),
-                    videos_found,
-                    st.session_state.get('session_id', 'manual')
-                ])
-        except Exception as e:
-            self.add_log(f"Could not save used query: {str(e)}", "WARNING")
-    
-    def validate_video_for_category(self, search_item: Dict, target_category: str, require_captions: bool = True) -> Tuple[bool, str]:
-        """Validate video against collection criteria for specific category with detailed logging"""
+    def validate_video_optimized(self, search_item: Dict, target_category: str, 
+                                require_captions: bool = True) -> Tuple[bool, any]:
+        """Optimized validation that leverages pre-filtering"""
         video_id = search_item['id']['videoId']
         video_url = f"https://youtube.com/watch?v={video_id}"
         title = search_item['snippet']['title']
         
-        self.add_log(f"Starting validation for: {title[:50]}...")
+        # Quick duplicate checks first (no API call)
+        existing_ids = [v['video_id'] for v in st.session_state.collected_videos]
+        if video_id in existing_ids or video_id in self.existing_sheet_ids:
+            return False, "Duplicate video"
         
-        # Step 1: Get video details
+        if video_url in self.discarded_urls:
+            return False, "Already processed"
+        
+        # Get details (API call) - only for non-duplicates
         details = self.get_video_details(video_id)
         if not details:
-            self.add_log(f"REJECTED: Could not fetch video details for {video_id}", "WARNING")
-            return False, "Could not fetch video details"
+            return False, "Could not fetch details"
         
-        self.add_log(f"✓ Video details fetched successfully", "INFO")
-        
-        # Step 2: Duplicate check - Current session
-        existing_ids = [v['video_id'] for v in st.session_state.collected_videos]
-        if video_id in existing_ids:
-            self.add_log(f"REJECTED: Video {video_id} already in current session", "WARNING")
-            return False, "Duplicate video (already in current session)"
-        
-        self.add_log(f"✓ Not duplicate in current session", "INFO")
-        
-        # Step 3: Duplicate check - Already in raw_links
-        if video_id in self.existing_sheet_ids:
-            self.add_log(f"REJECTED: Video {video_id} already exists in raw_links sheet", "WARNING")
-            return False, "Duplicate video (already in raw_links)"
-        
-        self.add_log(f"✓ Not duplicate in raw_links sheet", "INFO")
-        
-        # Step 4: Duplicate check - Already processed (in discarded)
-        if video_url in self.discarded_urls:
-            self.add_log(f"REJECTED: Video URL already processed (found in discarded table)", "WARNING")
-            return False, "Video already processed (found in discarded)"
-        
-        self.add_log(f"✓ Not found in discarded table", "INFO")
-        
-        # Step 5: Caption check
+        # Caption check
         if require_captions:
             has_captions = self.check_caption_availability(details)
             if not has_captions:
-                self.add_log(f"REJECTED: No captions available for video {video_id}", "WARNING")
                 return False, "No captions available"
-            self.add_log(f"✓ Captions available", "INFO")
         else:
             self.check_caption_availability(details)
-            self.add_log(f"✓ Caption check skipped (not required)", "INFO")
         
-        # Step 6: Age check
-        published_at = datetime.fromisoformat(details['snippet']['publishedAt'].replace('Z', '+00:00'))
-        six_months_ago = datetime.now(published_at.tzinfo) - timedelta(days=180)
-        age_days = (datetime.now(published_at.tzinfo) - published_at).days
-        
-        if published_at < six_months_ago:
-            self.add_log(f"REJECTED: Video too old ({age_days} days, limit: 180 days)", "WARNING")
-            return False, "Video older than 6 months"
-        
-        self.add_log(f"✓ Age check passed ({age_days} days old)", "INFO")
-        
-        # Step 7: YouTube Short check
-        if self.is_youtube_short(video_id, details):
-            self.add_log(f"REJECTED: Video detected as YouTube Short", "WARNING")
-            return False, "YouTube Short detected"
-        
-        self.add_log(f"✓ Not a YouTube Short", "INFO")
-        
-        # Step 8: Duration check
+        # Duration check (already filtered by API but double-check)
         duration = isodate.parse_duration(details['contentDetails']['duration'])
         duration_seconds = duration.total_seconds()
         
         if duration_seconds < 90:
-            self.add_log(f"REJECTED: Video too short ({duration_seconds}s, minimum: 90s)", "WARNING")
             return False, f"Video too short ({duration_seconds}s < 90s)"
         
-        self.add_log(f"✓ Duration check passed ({duration_seconds}s)", "INFO")
-        
-        # Step 9: Content type exclusion - Music
-        title_lower = details['snippet']['title'].lower()
-        tags = [tag.lower() for tag in details['snippet'].get('tags', [])]
-        
-        for keyword in self.music_keywords:
-            if keyword in title_lower or any(keyword in tag for tag in tags):
-                self.add_log(f"REJECTED: Music video detected (keyword: {keyword})", "WARNING")
-                return False, f"Music video detected (keyword: {keyword})"
-        
-        self.add_log(f"✓ Music video check passed", "INFO")
-        
-        # Step 10: Content type exclusion - Compilation
-        for keyword in self.compilation_keywords:
-            if keyword in title_lower or any(keyword in tag for tag in tags):
-                self.add_log(f"REJECTED: Compilation video detected (keyword: {keyword})", "WARNING")
-                return False, f"Compilation detected (keyword: {keyword})"
-        
-        self.add_log(f"✓ Compilation check passed", "INFO")
-        
-        # Step 11: View count check
+        # View count check
         view_count = int(details['statistics'].get('viewCount', 0))
         if view_count < 10000:
-            self.add_log(f"REJECTED: View count too low ({view_count:,}, minimum: 10,000)", "WARNING")
             return False, f"View count too low ({view_count} < 10,000)"
         
-        self.add_log(f"✓ View count check passed ({view_count:,} views)", "INFO")
-        
-        # Step 12: Category relevance check
-        title_desc_text = (title_lower + ' ' + details['snippet'].get('description', '')).lower()
+        # Category relevance check
+        title_desc_text = (title.lower() + ' ' + details['snippet'].get('description', '')).lower()
         
         category_keywords = {
             'heartwarming': ['heartwarming', 'touching', 'emotional', 'reunion', 'surprise', 'family', 'love', 
                            'soldier', 'homecoming', 'dog reunion', 'acts kindness', 'baby first time', 
-                           'proposal reaction', 'homeless helped', 'teacher surprised', 'saving animal',
-                           'grateful', 'wholesome', 'sweet', 'helping'],
+                           'proposal reaction', 'homeless helped', 'teacher surprised', 'saving animal'],
             'funny': ['funny', 'comedy', 'humor', 'hilarious', 'joke', 'laugh', 'entertaining', 'fails', 
-                     'epic fail', 'instant karma', 'prank', 'bloopers', 'comedy gold', 'dad jokes',
-                     'silly', 'amusing', 'comical', 'laughing'],
+                     'epic fail', 'instant karma', 'prank', 'bloopers', 'comedy gold', 'dad jokes'],
             'traumatic': ['accident', 'tragedy', 'disaster', 'emergency', 'breaking news', 'shocking',
                         'dramatic rescue', 'natural disaster', 'police chase', 'survival story', 'near death',
-                        'extreme weather', 'earthquake', 'tornado', 'avalanche', 'explosion',
-                        'crash', 'incident', 'dangerous', 'intense']
+                        'extreme weather', 'earthquake', 'tornado', 'avalanche', 'explosion']
         }
         
         keywords = category_keywords.get(target_category, [])
         matched_keywords = [kw for kw in keywords if kw in title_desc_text]
         
         if not matched_keywords:
-            self.add_log(f"REJECTED: No {target_category} keywords found in title/description", "WARNING")
-            return False, f"No {target_category} keywords found in title/description"
+            return False, f"No {target_category} keywords found"
         
-        self.add_log(f"✓ Category check passed - matched keywords: {', '.join(matched_keywords[:3])}", "SUCCESS")
-        self.add_log(f"VALIDATION COMPLETE: Video {video_id} passed all checks!", "SUCCESS")
+        self.add_log(f"✓ Validated: {title[:50]}... - Keywords: {', '.join(matched_keywords[:3])}", "SUCCESS")
         
         return True, details
     
-    def collect_videos(self, target_count: int, category: str, spreadsheet_id: str = None, require_captions: bool = True, progress_callback=None):
-        """Main collection logic for specified category"""
+    def collect_videos_with_pagination(self, target_count: int, category: str, 
+                                      spreadsheet_id: str = None, require_captions: bool = True,
+                                      region_code: str = None, category_id: str = None,
+                                      progress_callback=None):
+        """Enhanced collection with pagination support"""
         collected = []
         
         if category == 'mixed':
@@ -822,14 +812,15 @@ class YouTubeCollector:
         else:
             categories = [category]
         
-        self.add_log(f"Starting collection for category: {category}, target: {target_count} videos", "INFO")
+        self.add_log(f"Starting collection with pagination for: {category}", "INFO")
         
-        # Load existing data from sheet
+        # Load existing data
         if spreadsheet_id and self.sheets_exporter:
-            self.existing_sheet_ids = self.load_existing_sheet_ids(spreadsheet_id)
-            self.discarded_urls = self.load_discarded_urls(spreadsheet_id)
-            self.existing_queries = self.load_used_queries(spreadsheet_id)
+            self.existing_sheet_ids = self.sheets_exporter.load_existing_sheet_ids(spreadsheet_id)
+            self.discarded_urls = self.sheets_exporter.load_discarded_urls(spreadsheet_id)
+            self.existing_queries = self.sheets_exporter.load_used_queries(spreadsheet_id)
             st.session_state.used_queries.update(self.existing_queries)
+            self.add_log(f"Loaded {len(self.existing_sheet_ids)} existing IDs, {len(self.discarded_urls)} discarded URLs", "INFO")
         
         category_index = 0
         attempts = 0
@@ -839,6 +830,7 @@ class YouTubeCollector:
         while len(collected) < target_count and attempts < max_attempts:
             current_category = categories[category_index % len(categories)]
             
+            # Get available queries
             available_queries = self.search_queries[current_category].copy()
             random.shuffle(available_queries)
             
@@ -852,77 +844,98 @@ class YouTubeCollector:
                 query = random.choice(available_queries)
             
             st.session_state.used_queries.add(query)
-            self.add_log(f"Searching category '{current_category}': {query}", "INFO")
+            self.add_log(f"Searching '{current_category}': {query}", "INFO")
             
-            search_results = self.search_videos(query)
+            # Pagination loop for current query
+            page_token = None
+            pages_fetched = 0
+            max_pages = 3  # Fetch up to 3 pages (150 results) per query
             
-            if not search_results:
-                attempts += 1
-                category_index += 1
-                continue
-            
-            videos_found_this_query = 0
-            for item in search_results:
-                if len(collected) >= target_count:
+            while pages_fetched < max_pages and len(collected) < target_count:
+                # Get search results with pagination
+                search_results, next_page_token = self.search_videos(
+                    query, 
+                    max_results=50,
+                    page_token=page_token,
+                    region_code=region_code,
+                    category_id=category_id
+                )
+                
+                if not search_results:
                     break
                 
-                video_id = item['id']['videoId']
+                pages_fetched += 1
+                self.add_log(f"Processing page {pages_fetched} of results ({len(search_results)} items)", "INFO")
                 
-                if video_id in videos_checked_ids:
-                    continue
+                videos_found_this_page = 0
                 
-                videos_checked_ids.add(video_id)
-                st.session_state.collector_stats['checked'] += 1
+                for item in search_results:
+                    if len(collected) >= target_count:
+                        break
+                    
+                    video_id = item['id']['videoId']
+                    
+                    if video_id in videos_checked_ids:
+                        continue
+                    
+                    videos_checked_ids.add(video_id)
+                    st.session_state.collector_stats['checked'] += 1
+                    
+                    # Validate video (optimized version)
+                    result = self.validate_video_optimized(item, current_category, require_captions)
+                    
+                    if result[0]:
+                        details = result[1]
+                        
+                        video_record = {
+                            'video_id': video_id,
+                            'title': details['snippet']['title'],
+                            'url': f"https://youtube.com/watch?v={video_id}",
+                            'category': current_category,
+                            'search_query': query,
+                            'duration_seconds': int(isodate.parse_duration(
+                                details['contentDetails']['duration']
+                            ).total_seconds()),
+                            'view_count': int(details['statistics'].get('viewCount', 0)),
+                            'like_count': int(details['statistics'].get('likeCount', 0)),
+                            'comment_count': int(details['statistics'].get('commentCount', 0)),
+                            'published_at': details['snippet']['publishedAt'],
+                            'channel_title': details['snippet']['channelTitle'],
+                            'tags': ','.join(details['snippet'].get('tags', [])),
+                            'collected_at': datetime.now().isoformat(),
+                            'page_number': pages_fetched,
+                            'region_code': region_code or 'ALL',
+                            'category_filter': category_id or '0'
+                        }
+                        
+                        collected.append(video_record)
+                        st.session_state.collected_videos.append(video_record)
+                        st.session_state.collector_stats['found'] += 1
+                        videos_found_this_page += 1
+                        
+                        self.add_log(f"✅ ADDED: {video_record['title'][:30]}... (page {pages_fetched})", "SUCCESS")
+                        
+                        if progress_callback:
+                            progress_callback(len(collected), target_count)
+                    else:
+                        st.session_state.collector_stats['rejected'] += 1
+                    
+                    time.sleep(0.2)
                 
-                result = self.validate_video_for_category(item, current_category, require_captions)
-                
-                if result[0]:
-                    details = result[1]
-                    
-                    video_record = {
-                        'video_id': video_id,
-                        'title': details['snippet']['title'],
-                        'url': f"https://youtube.com/watch?v={video_id}",
-                        'category': current_category,
-                        'search_query': query,
-                        'duration_seconds': int(isodate.parse_duration(
-                            details['contentDetails']['duration']
-                        ).total_seconds()),
-                        'view_count': int(details['statistics'].get('viewCount', 0)),
-                        'like_count': int(details['statistics'].get('likeCount', 0)),
-                        'comment_count': int(details['statistics'].get('commentCount', 0)),
-                        'published_at': details['snippet']['publishedAt'],
-                        'channel_title': details['snippet']['channelTitle'],
-                        'tags': ','.join(details['snippet'].get('tags', [])),
-                        'collected_at': datetime.now().isoformat()
-                    }
-                    
-                    collected.append(video_record)
-                    st.session_state.collected_videos.append(video_record)
-                    st.session_state.collector_stats['found'] += 1
-                    videos_found_this_query += 1
-                    
-                    self.add_log(f"✅ ADDED TO COLLECTION: {video_record['title'][:50]}... (category: {current_category})", "SUCCESS")
-                    self.add_log(f"Collection stats - Found: {st.session_state.collector_stats['found']}, Target: {target_count}", "INFO")
-                    
-                    if progress_callback:
-                        progress_callback(len(collected), target_count)
+                # Check if we should fetch next page
+                if next_page_token and videos_found_this_page > 0:
+                    page_token = next_page_token
+                    self.add_log(f"Found {videos_found_this_page} videos on page {pages_fetched}, fetching next page...", "INFO")
+                    time.sleep(1)
                 else:
-                    reason = result[1]
-                    st.session_state.collector_stats['rejected'] += 1
-                
-                time.sleep(0.3)
+                    break
             
             # Save used query
             if spreadsheet_id and self.sheets_exporter:
-                self.save_used_query(spreadsheet_id, query, current_category, videos_found_this_query)
+                self.sheets_exporter.save_used_query(spreadsheet_id, query, current_category, 
+                                                    sum(1 for v in collected if v.get('search_query') == query))
             
-            if videos_found_this_query == 0:
-                category_index += 1
-            else:
-                if videos_found_this_query >= 2:
-                    category_index += 1
-            
+            category_index += 1
             attempts += 1
             time.sleep(1.5)
         
@@ -940,7 +953,7 @@ class VideoRater:
         timestamp = datetime.now().strftime("%H:%M:%S")
         log_entry = f"[{timestamp}] RATER {log_type}: {message}"
         st.session_state.logs.insert(0, log_entry)
-        st.session_state.logs = st.session_state.logs[:100]  # Keep more logs for debugging
+        st.session_state.logs = st.session_state.logs[:100]
     
     def check_quota_available(self) -> Tuple[bool, str]:
         """Check if YouTube API quota is available"""
@@ -1042,13 +1055,21 @@ class VideoRater:
                 
                 if relevance_score > 0:
                     for timestamp_match in timestamps:
-                        timestamp = ':'.join(filter(None, timestamp_match))
-                        
-                        time_parts = timestamp.split(':')
-                        seconds = int(time_parts[0]) * 60 + int(time_parts[1]) if len(time_parts) == 2 else 0
+                        timestamp_str = ':'.join(filter(None, timestamp_match))
+                        if not timestamp_str:
+                            continue
+                            
+                        time_parts = timestamp_str.split(':')
+                        if len(time_parts) == 2:
+                            try:
+                                seconds = int(time_parts[0]) * 60 + int(time_parts[1])
+                            except ValueError:
+                                continue
+                        else:
+                            continue
                         
                         moments.append({
-                            'timestamp': timestamp,
+                            'timestamp': timestamp_str,
                             'seconds': seconds,
                             'comment': comment,
                             'relevance_score': relevance_score,
@@ -1324,4 +1345,505 @@ class VideoRater:
         confidence = 0.3
         if len(video_data['comments']) > 100:
             confidence += 0.3
-        if len(video_data['
+        if len(video_data['comments']) > 500:
+            confidence += 0.2
+        if comments_analysis['category_validation'] > 0.6:
+            confidence += 0.2
+        
+        return {
+            'final_score': min(final_score, 10.0),
+            'confidence': min(confidence, 1.0),
+            'component_scores': component_scores,
+            'comments_analysis': comments_analysis
+        }
+
+
+def main():
+    st.markdown("""
+    <div class="main-header">
+        <h1>YouTube Collection & Rating Tool</h1>
+        <p><strong>Optimized collector with pre-filtered search and pagination</strong></p>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    # Sidebar configuration
+    with st.sidebar:
+        st.header("Configuration")
+        
+        # Mode selection
+        mode = st.radio(
+            "Select Mode:",
+            ["Data Collector", "Video Rater"],
+            horizontal=True
+        )
+        
+        st.subheader("API Configuration")
+        youtube_api_key = st.text_input(
+            "YouTube API Key", 
+            type="password", 
+            help="Your YouTube Data API v3 key"
+        )
+        
+        st.subheader("Google Sheets Configuration")
+        creds_input_method = st.radio(
+            "Service Account JSON:",
+            ["Paste JSON", "Upload JSON file"]
+        )
+        
+        sheets_creds = None
+        if creds_input_method == "Paste JSON":
+            sheets_creds_text = st.text_area(
+                "Service Account JSON", 
+                help="Paste your complete Google service account JSON",
+                height=150
+            )
+            if sheets_creds_text:
+                try:
+                    sheets_creds = json.loads(sheets_creds_text)
+                    st.success("Valid JSON")
+                except json.JSONDecodeError as e:
+                    st.error(f"Invalid JSON: {str(e)}")
+        else:
+            uploaded_file = st.file_uploader(
+                "Upload Service Account JSON",
+                type=['json']
+            )
+            if uploaded_file:
+                try:
+                    sheets_creds = json.load(uploaded_file)
+                    st.success("JSON file loaded")
+                except Exception as e:
+                    st.error(f"Error reading file: {str(e)}")
+        
+        # Google Sheets URL/ID
+        spreadsheet_url = st.text_input(
+            "Google Sheet URL",
+            value="https://docs.google.com/spreadsheets/d/1PHvW-LykIpIbwKJbiGHi6NcX7hd4EsIWK3zwr4Dmvrk/",
+            help="URL or ID of your Google Sheets document"
+        )
+        
+        match = re.search(r'/d/([a-zA-Z0-9-_]+)', spreadsheet_url)
+        spreadsheet_id = match.group(1) if match else spreadsheet_url
+        
+        if spreadsheet_id:
+            st.success(f"Sheet ID: {spreadsheet_id[:20]}...")
+        
+        if sheets_creds and 'client_email' in sheets_creds:
+            st.info(f"Service Account: {sheets_creds['client_email'][:30]}...")
+        
+        # Add rate limit status display
+        if 'sheets_api_call_count' in st.session_state:
+            st.subheader("API Rate Limit Status")
+            
+            # Calculate current rate
+            current_time = time.time()
+            recent_calls = len([t for t in st.session_state.get('sheets_api_timestamps', []) 
+                              if current_time - t < 100])
+            
+            # Display metrics
+            col1, col2 = st.columns(2)
+            with col1:
+                st.metric("Total API Calls", st.session_state.sheets_api_call_count)
+            with col2:
+                color = "🟢" if recent_calls < 60 else "🟡" if recent_calls < 75 else "🔴"
+                st.metric(f"{color} Calls (last 100s)", f"{recent_calls}/80")
+            
+            if recent_calls >= 75:
+                st.warning("Approaching rate limit - automatic delays active")
+    
+    # Main content based on selected mode
+    if mode == "Data Collector":
+        st.subheader("Data Collector")
+        
+        with st.sidebar:
+            st.subheader("Collection Settings")
+            category = st.selectbox(
+                "Content Category",
+                options=['heartwarming', 'funny', 'traumatic', 'mixed']
+            )
+            
+            target_count = st.number_input(
+                "Target Video Count",
+                min_value=1,
+                max_value=500,
+                value=10
+            )
+            
+            # NEW: Region and Category filters
+            st.subheader("Search Filters")
+            
+            region_code = st.selectbox(
+                "Region Filter",
+                options=list(REGION_CODES.keys()),
+                format_func=lambda x: REGION_CODES[x],
+                help="Filter results by country/region"
+            )
+            
+            category_id = st.selectbox(
+                "YouTube Category",
+                options=list(YOUTUBE_CATEGORIES.keys()),
+                format_func=lambda x: YOUTUBE_CATEGORIES[x],
+                help="Filter by YouTube's content categories"
+            )
+            
+            auto_export = st.checkbox(
+                "Auto-export to Google Sheets",
+                value=True
+            )
+            
+            skip_quota_check = st.checkbox(
+                "Skip quota check",
+                value=False
+            )
+            
+            require_captions = st.checkbox(
+                "Require captions",
+                value=True
+            )
+            
+            # Display quota cost estimate
+            st.subheader("Quota Usage Estimate")
+            estimated_searches = min(target_count // 3, 10)  # Rough estimate
+            estimated_details = target_count * 2  # Assuming 50% pass rate
+            estimated_cost = (estimated_searches * 100) + (estimated_details * 1)
+            st.info(f"Estimated quota cost: ~{estimated_cost} units\n"
+                   f"(Search: {estimated_searches}×100 = {estimated_searches*100} units)\n"
+                   f"(Details: ~{estimated_details}×1 = {estimated_details} units)")
+        
+        # Statistics display
+        col1, col2, col3, col4 = st.columns(4)
+        
+        with col1:
+            st.metric("Videos Found", st.session_state.collector_stats['found'])
+        with col2:
+            st.metric("Videos Checked", st.session_state.collector_stats['checked'])
+        with col3:
+            st.metric("Search Calls", f"{st.session_state.collector_stats['search_calls']} ({st.session_state.collector_stats['search_calls']*100} units)")
+        with col4:
+            st.metric("Detail Calls", st.session_state.collector_stats['detail_calls'])
+        
+        # Control buttons
+        col1, col2, col3, col4 = st.columns(4)
+        
+        with col1:
+            if st.button("Start Collection", disabled=st.session_state.is_collecting, type="primary"):
+                if not youtube_api_key:
+                    st.error("Please enter your YouTube API key")
+                else:
+                    st.session_state.is_collecting = True
+                    st.session_state.collector_stats = {'checked': 0, 'found': 0, 'rejected': 0, 'search_calls': 0, 'detail_calls': 0, 'has_captions': 0, 'no_captions': 0}
+                    
+                    try:
+                        exporter = None
+                        if sheets_creds:
+                            try:
+                                exporter = GoogleSheetsExporter(sheets_creds)
+                            except Exception as e:
+                                st.warning(f"Could not initialize sheets exporter: {str(e)}")
+                        
+                        collector = YouTubeCollector(youtube_api_key, sheets_exporter=exporter)
+                        
+                        quota_available = True
+                        if not skip_quota_check:
+                            quota_available, quota_message = collector.check_quota_available()
+                            if not quota_available:
+                                st.error(f"Cannot start collection: {quota_message}")
+                                st.session_state.is_collecting = False
+                            else:
+                                st.success(f"{quota_message}")
+                        
+                        if quota_available:
+                            progress_bar = st.progress(0)
+                            status_text = st.empty()
+                            
+                            def update_progress(current, total):
+                                progress = current / total
+                                progress_bar.progress(progress)
+                                status_text.text(f"Collecting: {current}/{total} videos | Search calls: {st.session_state.collector_stats['search_calls']} | Detail calls: {st.session_state.collector_stats['detail_calls']}")
+                            
+                            with st.spinner(f"Collecting {target_count} videos for {category} with pagination..."):
+                                videos = collector.collect_videos_with_pagination(
+                                    target_count=target_count,
+                                    category=category,
+                                    spreadsheet_id=spreadsheet_id,
+                                    require_captions=require_captions,
+                                    region_code=region_code if region_code else None,
+                                    category_id=category_id if category_id != "0" else None,
+                                    progress_callback=update_progress
+                                )
+                            
+                            st.success(f"Collection complete! Found {len(videos)} videos.")
+                            st.info(f"Total API usage: {st.session_state.collector_stats['search_calls']*100 + st.session_state.collector_stats['detail_calls']} units")
+                            
+                            if auto_export and sheets_creds and videos:
+                                try:
+                                    collector.add_log(f"Starting auto-export of {len(videos)} videos to Google Sheets", "INFO")
+                                    if not exporter:
+                                        exporter = GoogleSheetsExporter(sheets_creds)
+                                        collector.add_log("Initialized Google Sheets exporter", "INFO")
+                                    
+                                    collector.add_log(f"Attempting to export to spreadsheet ID: {spreadsheet_id}", "INFO")
+                                    sheet_url = exporter.export_to_sheets(videos, spreadsheet_id=spreadsheet_id)
+                                    
+                                    if sheet_url:
+                                        st.success("Exported to Google Sheets!")
+                                        st.markdown(f"[Open Spreadsheet]({sheet_url})")
+                                        collector.add_log(f"✅ EXPORT SUCCESS: {len(videos)} videos exported to raw_links sheet", "SUCCESS")
+                                        collector.add_log(f"Spreadsheet URL: {sheet_url}", "INFO")
+                                    else:
+                                        collector.add_log("❌ EXPORT FAILED: No spreadsheet URL returned", "ERROR")
+                                        st.error("Export completed but no URL returned")
+                                        
+                                except Exception as e:
+                                    error_msg = str(e)
+                                    collector.add_log(f"❌ EXPORT ERROR: {error_msg}", "ERROR")
+                                    st.error(f"Export failed: {error_msg}")
+                                    
+                                    if "authentication" in error_msg.lower():
+                                        collector.add_log("Check Google Sheets service account credentials", "ERROR")
+                                    elif "permission" in error_msg.lower():
+                                        collector.add_log("Check if service account has write access to spreadsheet", "ERROR")
+                                    elif "spreadsheet" in error_msg.lower():
+                                        collector.add_log("Check if spreadsheet ID is correct and accessible", "ERROR")
+                            else:
+                                if not auto_export:
+                                    collector.add_log("Auto-export disabled - videos collected but not exported", "INFO")
+                                elif not sheets_creds:
+                                    collector.add_log("No Google Sheets credentials - cannot export", "WARNING")
+                                elif not videos:
+                                    collector.add_log("No videos collected - nothing to export", "INFO")
+                    
+                    except Exception as e:
+                        st.error(f"Collection error: {str(e)}")
+                    finally:
+                        st.session_state.is_collecting = False
+                        st.rerun()
+        
+        with col2:
+            if st.button("Stop", disabled=not st.session_state.is_collecting):
+                st.session_state.is_collecting = False
+                st.rerun()
+        
+        with col3:
+            if st.button("Reset"):
+                st.session_state.collected_videos = []
+                st.session_state.collector_stats = {'checked': 0, 'found': 0, 'rejected': 0, 'search_calls': 0, 'detail_calls': 0, 'has_captions': 0, 'no_captions': 0}
+                st.rerun()
+        
+        with col4:
+            if st.button("Manual Export") and st.session_state.collected_videos:
+                if not sheets_creds:
+                    st.error("Please add Google Sheets credentials")
+                else:
+                    try:
+                        exporter = GoogleSheetsExporter(sheets_creds)
+                        sheet_url = exporter.export_to_sheets(
+                            st.session_state.collected_videos, 
+                            spreadsheet_id=spreadsheet_id
+                        )
+                        if sheet_url:
+                            st.success("Exported to Google Sheets!")
+                            st.markdown(f"[Open Spreadsheet]({sheet_url})")
+                    except Exception as e:
+                        st.error(f"Export failed: {str(e)}")
+        
+        # Display collected videos
+        if st.session_state.collected_videos:
+            st.subheader("Collected Videos")
+            df = pd.DataFrame(st.session_state.collected_videos)
+            
+            # Show relevant columns including new filter data
+            display_columns = ['title', 'category', 'view_count', 'duration_seconds', 'page_number', 'region_code', 'url']
+            available_columns = [col for col in display_columns if col in df.columns]
+            
+            st.dataframe(
+                df[available_columns],
+                use_container_width=True,
+                hide_index=True
+            )
+    
+    elif mode == "Video Rater":
+        st.subheader("Video Rater")
+        
+        # Statistics display
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            st.metric("Videos Rated", st.session_state.rater_stats['rated'])
+        with col2:
+            st.metric("Moved to tobe_links", st.session_state.rater_stats['moved_to_tobe'])
+        with col3:
+            st.metric("API Calls", st.session_state.rater_stats['api_calls'])
+        
+        if not youtube_api_key or not sheets_creds or not spreadsheet_id:
+            st.warning("Please configure YouTube API key, Google Sheets credentials, and spreadsheet URL in the sidebar.")
+        else:
+            # Processing delay configuration
+            processing_delay = 2.0
+            if 'processing_delay' not in st.session_state:
+                st.session_state.processing_delay = 2.0
+            
+            col1, col2 = st.columns([1, 1])
+            
+            with col1:
+                if st.button("Start Rating", disabled=st.session_state.is_rating, type="primary"):
+                    st.session_state.is_rating = True
+                    st.rerun()
+            
+            with col2:
+                if st.button("Stop Rating", disabled=not st.session_state.is_rating):
+                    st.session_state.is_rating = False
+                    st.rerun()
+            
+            if st.session_state.is_rating:
+                try:
+                    rater = VideoRater(youtube_api_key)
+                    exporter = GoogleSheetsExporter(sheets_creds)
+                    
+                    while st.session_state.is_rating:
+                        quota_available, quota_message = rater.check_quota_available()
+                        
+                        if not quota_available:
+                            st.error(f"Stopping rating: {quota_message}")
+                            st.session_state.is_rating = False
+                            break
+                        
+                        next_video = exporter.get_next_raw_video(spreadsheet_id)
+                        
+                        if not next_video:
+                            st.success("All videos have been processed! No more videos in raw_links.")
+                            st.session_state.is_rating = False
+                            break
+                        
+                        video_category = next_video.get('category', 'heartwarming')
+                        
+                        video_container = st.container()
+                        
+                        with video_container:
+                            st.markdown(f"### Currently Processing:")
+                            st.markdown(f"**Title:** {next_video.get('title', 'Unknown Title')}")
+                            st.markdown(f"**Channel:** {next_video.get('channel_title', 'Unknown')}")
+                            st.markdown(f"**Category:** {video_category} {CATEGORIES.get(video_category, {}).get('emoji', '')}")
+                            
+                            col1, col2, col3 = st.columns(3)
+                            with col1:
+                                st.metric("Views", f"{int(float(next_video.get('view_count', 0))):,}")
+                            with col2:
+                                st.metric("Likes", f"{int(float(next_video.get('like_count', 0))):,}")
+                            with col3:
+                                st.metric("Comments", f"{int(float(next_video.get('comment_count', 0))):,}")
+                        
+                        with st.spinner("Analyzing video..."):
+                            video_id = next_video.get('video_id')
+                            if video_id:
+                                try:
+                                    video_data = rater.fetch_video_data(video_id)
+                                    analysis = rater.calculate_category_score(video_data, video_category)
+                                    
+                                    score = analysis['final_score']
+                                    confidence = analysis['confidence']
+                                    
+                                    col1, col2 = st.columns([2, 1])
+                                    
+                                    with col2:
+                                        st.markdown(f"""
+                                        <div class="score-card">
+                                            <h2>Score</h2>
+                                            <h1 style="font-size: 3rem;">{score:.1f}/10</h1>
+                                            <p>Confidence: {confidence:.0%}</p>
+                                        </div>
+                                        """, unsafe_allow_html=True)
+                                    
+                                    with col1:
+                                        moments = analysis['comments_analysis'].get('timestamped_moments', [])
+                                        if moments:
+                                            st.subheader("Timestamped Moments")
+                                            for moment in moments[:5]:
+                                                st.markdown(f"""
+                                                <div class="timestamp-moment">
+                                                    <strong>{moment['timestamp']}</strong><br>
+                                                    <em>"{moment['comment'][:100]}{'...' if len(moment['comment']) > 100 else ''}"</em>
+                                                </div>
+                                                """, unsafe_allow_html=True)
+                                        else:
+                                            st.info("No timestamped moments found")
+                                    
+                                    video_url = next_video.get('url', '')
+                                    
+                                    if video_url:
+                                        exporter.add_to_discarded(spreadsheet_id, video_url)
+                                    
+                                    exporter.delete_raw_video(spreadsheet_id, next_video['row_number'])
+                                    
+                                    if score >= 6.5:
+                                        exporter.add_to_tobe_links(spreadsheet_id, next_video, analysis)
+                                        
+                                        exporter.add_time_comments(
+                                            spreadsheet_id, 
+                                            video_id, 
+                                            video_url, 
+                                            analysis['comments_analysis']
+                                        )
+                                        
+                                        st.session_state.rater_stats['moved_to_tobe'] += 1
+                                        st.success(f"✅ Score: {score:.1f}/10 - Moved to tobe_links!")
+                                        rater.add_log(f"Video {next_video.get('title', '')[:50]} scored {score:.1f} - moved to tobe_links and time_comments", "SUCCESS")
+                                    else:
+                                        st.info(f"ℹ️ Score: {score:.1f}/10 - Below threshold, removed from raw_links.")
+                                        rater.add_log(f"Video {next_video.get('title', '')[:50]} scored {score:.1f} - removed", "INFO")
+                                    
+                                    rater.add_log(f"Added URL to discarded: {video_url}", "INFO")
+                                    
+                                    st.session_state.rater_stats['rated'] += 1
+                                    
+                                    time.sleep(processing_delay)
+                                    
+                                    video_container.empty()
+                                
+                                except Exception as e:
+                                    st.error(f"Error analyzing video: {str(e)}")
+                                    rater.add_log(f"Error analyzing video: {str(e)}", "ERROR")
+                                    
+                                    video_url = next_video.get('url', '')
+                                    if video_url:
+                                        exporter.add_to_discarded(spreadsheet_id, video_url)
+                                        rater.add_log(f"Added failed video URL to discarded: {video_url}", "INFO")
+                                    
+                                    exporter.delete_raw_video(spreadsheet_id, next_video['row_number'])
+                                    time.sleep(processing_delay)
+                            else:
+                                st.error("No video ID found")
+                                
+                                video_url = next_video.get('url', '')
+                                if video_url:
+                                    exporter.add_to_discarded(spreadsheet_id, video_url)
+                                    rater.add_log(f"Added video with missing ID to discarded: {video_url}", "INFO")
+                                
+                                exporter.delete_raw_video(spreadsheet_id, next_video['row_number'])
+                        
+                        if st.session_state.is_rating:
+                            time.sleep(0.5)
+                            st.rerun()
+                
+                except Exception as e:
+                    st.error(f"Rating error: {str(e)}")
+                    st.session_state.is_rating = False
+    
+    # Activity log
+    with st.expander("Activity Log", expanded=False):
+        if st.session_state.logs:
+            for log in st.session_state.logs[-20:]:
+                if "SUCCESS" in log:
+                    st.success(log)
+                elif "ERROR" in log:
+                    st.error(log)
+                elif "WARNING" in log:
+                    st.warning(log)
+                else:
+                    st.info(log)
+        else:
+            st.info("No activity yet")
+
+
+if __name__ == "__main__":
+    main()
